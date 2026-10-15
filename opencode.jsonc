@@ -1,0 +1,60 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "lsp": true,
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true,
+      "headers": {
+        "CONTEXT7_API_KEY": "{ENV:CONTEXT7_API_KEY}"
+      }
+    },
+    "github": {
+      "type": "remote",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "enabled":true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer {env:GITHUB_PAT}"
+      }
+    },
+    "linear": {
+      "type": "remote",
+      "url": "https://mcp.linear.app/mcp",
+      "enabled": true
+    },
+  },
+  "permission": {
+    "context7*": "deny",
+    "github*": "deny",
+    "linear*": "deny",
+  },
+  "agent": {
+    "librarian": {
+      "permission": {
+        "context7*": "allow"
+      }
+    },
+    "commits": {
+      "permission": {
+        "github*": "allow"
+      }
+    },
+    "orchestrator": {
+      "permission": {
+        "linear*": "allow"
+      }
+    },
+    "build-verify": {
+      "permission": {
+        "context7*": "deny",
+        "github*": "deny",
+        "linear*": "deny",
+      }
+    }
+  },
+  "watcher": {
+    "ignore": ["node_modules/**", "dist/**", ".git/**"]
+  }
+}
