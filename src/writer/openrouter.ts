@@ -12,6 +12,8 @@ export interface LlmDeps {
   timeoutMs?: number;
   /** Max response body size in bytes (default LLM_MAX_BODY_BYTES). */
   maxBytes?: number;
+  /** Backoff wait between retries (default: real setTimeout — inject a noop in tests). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** OpenAI-compatible chat-completions endpoint (OpenRouter). */
@@ -34,6 +36,16 @@ export const LLM_MAX_TOKENS = 2000;
 
 /** Captions are short — 1 MB is already generous; anything bigger is hostile. */
 export const LLM_MAX_BODY_BYTES = 1 * 1024 * 1024;
+
+/**
+ * Backoff between transient-failure retries: ~750ms then ~2000ms. Total added
+ * wall-time stays under ~3s in the worst case (free-tier 502s are usually a
+ * brief capacity blip, so a short backoff is enough without stalling the run).
+ */
+export const LLM_RETRY_DELAYS_MS = [750, 2000];
+
+/** 1 initial attempt + 1 retry per backoff delay (3 attempts total). */
+export const LLM_MAX_ATTEMPTS = LLM_RETRY_DELAYS_MS.length + 1;
 
 export interface LlmConfig {
   apiKey: string | undefined;
@@ -158,15 +170,47 @@ function stripThinkBlocks(text: string): string {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
+/** Transient HTTP statuses worth one more attempt: rate limit + server blips. */
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+/**
+ * Transient transport errors worth one more attempt: dropped connections and
+ * the like. NOT retryable: `AbortSignal.timeout` exhaustion (`TimeoutError` /
+ * `AbortError` — the stall budget already ran out, waiting longer burns quota
+ * for nothing) and redirect rejections (fail-closed `redirect: 'error'` is
+ * deterministic — retrying just re-sends the key at the same wall).
+ */
+function isRetryableFetchError(err: unknown): boolean {
+  if (err instanceof DOMException) {
+    return err.name !== 'TimeoutError' && err.name !== 'AbortError';
+  }
+  if (err instanceof TypeError && /redirect/i.test(err.message)) return false;
+  return true;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * One LLM call → raw Spanish caption for an article. Throws a typed
- * quota), timeouts, oversize bodies, unexpected shapes, or empty replies —
- * callers catch per article so one failure never blocks the rest, and the
- * article stays `selected` for a retry. Error messages never contain the key.
+ * `llm write failed for article <id>: <cause>` error — callers catch per
+ * article so one failure never blocks the rest, and the article stays
+ * `selected` for a retry. Error messages never contain the key.
+ *
+ * Transient failures (HTTP 429 / 5xx, dropped connections) are retried up to
+ * 2 times with a short backoff — free-tier 502 blips resolve on their own and
+ * a manual re-run should not be needed. Deterministic failures (other 4xx,
+ * timeouts, bad shapes, truncation, empty replies) fail immediately: retrying
+ * those only burns free-tier quota. Retries are silent (no per-attempt log
+ * noise with key material) — the run summary still just reports ok/FAILED.
  */
 export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promise<string> {
   const maxBytes = deps.maxBytes ?? LLM_MAX_BODY_BYTES;
   const timeoutMs = deps.timeoutMs ?? LLM_TIMEOUT_MS;
+  const sleep = deps.sleep ?? defaultSleep;
   const fail = (cause: string): Error =>
     new Error(`llm write failed for article ${article.id}: ${sanitize(cause, deps.apiKey)}`);
 
@@ -180,62 +224,76 @@ export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promi
     throw fail(err instanceof Error ? err.message : String(err));
   }
 
-  let res: Response;
-  try {
-    // The key rides in the Authorization header: never follow redirects —
-    // fail closed rather than forward the secret to an untrusted target
-    // (same convention as the NewsData fetcher).
-    res = await deps.fetchFn(OPENROUTER_URL, {
-      method: 'POST',
-      redirect: 'error',
-      headers: {
-        Authorization: `Bearer ${deps.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: deps.model,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt },
-        ],
-        max_tokens: LLM_MAX_TOKENS,
-        temperature: 0.7,
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (err) {
-    throw fail(`request failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  const requestInit = (): RequestInit => ({
+    method: 'POST',
+    redirect: 'error',
+    headers: {
+      Authorization: `Bearer ${deps.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: deps.model,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: LLM_MAX_TOKENS,
+      temperature: 0.7,
+    }),
+    // Fresh stall budget per attempt — a reused signal could already be spent.
+    signal: AbortSignal.timeout(timeoutMs),
+  });
 
-  if (!res.ok) {
-    // Release the connection before throwing; the status is all we report.
+  for (let attempt = 0; ; attempt += 1) {
+    let res: Response;
     try {
-      await res.body?.cancel();
-    } catch {
-      // A broken body must not mask the HTTP error — ignore cancel failures.
+      // The key rides in the Authorization header: never follow redirects —
+      // fail closed rather than forward the secret to an untrusted target
+      // (same convention as the NewsData fetcher).
+      res = await deps.fetchFn(OPENROUTER_URL, requestInit());
+    } catch (err) {
+      if (isRetryableFetchError(err) && attempt < LLM_RETRY_DELAYS_MS.length) {
+        await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw fail(`request failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    throw fail(`HTTP ${res.status}`);
-  }
 
-  let body: unknown;
-  try {
-    body = await readJsonCapped(res, maxBytes);
-  } catch (err) {
-    throw fail(err instanceof Error ? err.message : String(err));
-  }
-
-  const choice = (body as { choices?: Array<{ finish_reason?: unknown; message?: unknown }> })?.choices?.[0];
-  const raw = messageContent(choice?.message);
-  if (raw === null) {
-    // Reasoning models cut off mid-chain-of-thought report content:null with
-    // finish_reason length — actionable (budget/model issue), not a generic
-    // shape mystery. The article stays `selected` for a retry.
-    if (choice?.finish_reason === 'length') {
-      throw fail('response truncated before any caption text (finish_reason length)');
+    if (!res.ok) {
+      // Release the connection before throwing OR retrying; the status is all
+      // we report.
+      try {
+        await res.body?.cancel();
+      } catch {
+        // A broken body must not mask the HTTP error — ignore cancel failures.
+      }
+      if (isRetryableStatus(res.status) && attempt < LLM_RETRY_DELAYS_MS.length) {
+        await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw fail(`HTTP ${res.status}`);
     }
-    throw fail('unexpected response shape');
+
+    let body: unknown;
+    try {
+      body = await readJsonCapped(res, maxBytes);
+    } catch (err) {
+      throw fail(err instanceof Error ? err.message : String(err));
+    }
+
+    const choice = (body as { choices?: Array<{ finish_reason?: unknown; message?: unknown }> })?.choices?.[0];
+    const raw = messageContent(choice?.message);
+    if (raw === null) {
+      // Reasoning models cut off mid-chain-of-thought report content:null with
+      // finish_reason length — actionable (budget/model issue), not a generic
+      // shape mystery. The article stays `selected` for a retry.
+      if (choice?.finish_reason === 'length') {
+        throw fail('response truncated before any caption text (finish_reason length)');
+      }
+      throw fail('unexpected response shape');
+    }
+    const content = stripThinkBlocks(raw);
+    if (content === '') throw fail('empty reply');
+    return content;
   }
-  const content = stripThinkBlocks(raw);
-  if (content === '') throw fail('empty reply');
-  return content;
 }

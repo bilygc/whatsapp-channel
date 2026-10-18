@@ -83,10 +83,13 @@ describe('generateCaption', () => {
 
   it('fails typed (never raw) on HTTP errors, with the key redacted', async () => {
     const fetchFn = vi.fn(async () => ({ ok: false, status: 429 }) as unknown as Response);
-    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).rejects.toThrow(
+    // Noop sleep: persistent 429s now exhaust 3 attempts (2 backoffs) — the
+    // final typed error is what this test asserts, not the wait.
+    const noSleep = async (_ms: number) => {};
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep: noSleep }))).rejects.toThrow(
       /^llm write failed for article 1: /,
     );
-    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).rejects.not.toThrow(/test-key/);
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep: noSleep }))).rejects.not.toThrow(/test-key/);
   });
 
   it('fails typed on timeouts/aborts, with the key redacted', async () => {
@@ -196,7 +199,7 @@ describe('generateCaption', () => {
           body: { cancel: async () => { cancelled = true; } },
         }) as unknown as Response,
     );
-    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).rejects.toThrow(
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.toThrow(
       /^llm write failed for article 1: HTTP 429$/,
     );
     expect(cancelled).toBe(true);
@@ -330,5 +333,134 @@ describe('generateCaption', () => {
     await expect(generateCaption(ARTICLE, deps({ fetchFn }))).rejects.not.toThrow(
       /The user wants/,
     );
+  });
+
+  it('retries transient 502s then succeeds (3 attempts, sleeps between)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    let cancels = 0;
+    const failed = (): Response =>
+      ({
+        ok: false,
+        status: 502,
+        headers: { get: () => null },
+        body: {
+          cancel: async () => {
+            cancels += 1;
+          },
+        },
+      }) as unknown as Response;
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(failed())
+      .mockResolvedValueOnce(failed())
+      .mockResolvedValueOnce(
+        okResponse('🔥 caption\n\nFuente: IGN https://example.com/elden-ring-dlc'),
+      );
+    const caption = await generateCaption(ARTICLE, deps({ fetchFn, sleep }));
+    expect(caption).toContain('caption');
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenNthCalledWith(1, 750);
+    expect(sleep).toHaveBeenNthCalledWith(2, 2000);
+    expect(cancels).toBe(2);
+  });
+
+  it('gives up after 3 attempts on persistent 502 (typed HTTP 502, no leak)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(
+      async () => ({ ok: false, status: 502, headers: { get: () => null } }) as unknown as Response,
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /^llm write failed for article 1: HTTP 502$/,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries 429 then succeeds', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        ({ ok: false, status: 429, headers: { get: () => null } }) as unknown as Response,
+      )
+      .mockResolvedValueOnce(
+        okResponse('🔥 caption\n\nFuente: IGN https://example.com/elden-ring-dlc'),
+      );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).resolves.toContain(
+      'caption',
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry 401 (single call, no sleep)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(
+      async () => ({ ok: false, status: 401, headers: { get: () => null } }) as unknown as Response,
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /^llm write failed for article 1: HTTP 401$/,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('does not retry unexpected response shapes (single call, no sleep)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          arrayBuffer: async () => new TextEncoder().encode(JSON.stringify({ nope: 1 })).buffer as ArrayBuffer,
+          json: async () => ({ nope: 1 }),
+        }) as unknown as Response,
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /unexpected response shape/,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('retries a dropped connection (TypeError) then succeeds', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed: socket hang up'))
+      .mockResolvedValueOnce(
+        okResponse('🔥 caption\n\nFuente: IGN https://example.com/elden-ring-dlc'),
+      );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).resolves.toContain(
+      'caption',
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry AbortSignal.timeout exhaustion (TimeoutError: single call, no sleep)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () => {
+      throw new DOMException('The operation was aborted due to timeout.', 'TimeoutError');
+    });
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /^llm write failed for article 1: /,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('does not retry redirect rejections (deterministic, single call, no sleep)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () => {
+      throw new TypeError('fetch failed: unexpected redirect');
+    });
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /^llm write failed for article 1: .*redirect/,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 });
