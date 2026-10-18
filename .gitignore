@@ -1,1 +1,9 @@
 whatsapp-channel-plan.md
+
+# Local SQLite database + WAL sidecars/backups (schema lives in src/db/migrations/)
+data/
+node_modules/
+dist/
+
+# Secrets — see .env.example
+.env
