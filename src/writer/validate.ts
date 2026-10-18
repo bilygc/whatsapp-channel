@@ -45,6 +45,31 @@ export function scrub(text: string): string {
 }
 
 /**
+ * Cut `body` to `room` chars (including the trailing `…`), always at a
+ * whitespace boundary so no partial token survives the cut. Dropping a
+ * partial token whole is what keeps a sliced `https://…` fragment out of
+ * the stored caption — a truncated link would auto-linkify to a squatted
+ * domain. As a side effect a surrogate pair (emoji) is never split either.
+ * A body with no whitespace boundary is a single giant token: it is
+ * dropped whole when URL-shaped (a lone URL is not body copy worth a
+ * partial link), otherwise hard-cut without leaving a lone surrogate.
+ *
+ * Shared with the Telegram sender (`src/telegram/caption.ts`), which
+ * applies the same rule to legacy drafts: this lives here (not in
+ * telegram/) so the writer never imports from the delivery layer.
+ */
+export function truncateBodyAtBoundary(body: string, room: number): string {
+  if (body.length <= room) return body;
+  const head = body.slice(0, room - 1); // reserve 1 char for '…'
+  const cutAt = head.search(/\s\S*$/);
+  if (cutAt > 0) return `${head.slice(0, cutAt).trimEnd()}…`;
+  if (/https?:\/\//i.test(head) || /^www\./i.test(head)) return '';
+  // Hard cut of a non-URL token: never leave a lone surrogate behind.
+  const safe = /[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head;
+  return `${safe}…`;
+}
+
+/**
  * A body line survives only when it carries no foreign links: every linkable
  * token in the line must equal the true article URL (trailing punctuation
  * trimmed). A line with zero linkable tokens always survives. This
@@ -128,7 +153,10 @@ export function normalizeCaption(input: ValidateInput): string {
 
   const room = MAX_CAPTION_CHARS - required.length - 2; // blank line before Fuente
   if (room < 1) return required;
-  const truncated = body.length > room ? `${body.slice(0, room - 1)}…` : body;
+  // Boundary cut (shared with the Telegram sender): never store a partial
+  // `https://…` fragment — the true URL is dropped whole here and re-added
+  // verbatim in the canonical attribution below.
+  const truncated = truncateBodyAtBoundary(body, room);
   if (truncated === '') return required;
   return `${truncated}\n\n${required}`;
 }

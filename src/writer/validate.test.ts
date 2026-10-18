@@ -237,4 +237,29 @@ describe('normalizeCaption', () => {
     const links = out.match(/https?:\/\/\S+/gi) ?? [];
     expect(links).toHaveLength(2);
   });
+
+  it('never stores a partial https:// fragment when the true URL straddles the cut boundary', () => {
+    const required = `Fuente: ${SOURCE} ${URL}`;
+    const room = MAX_CAPTION_CHARS - required.length - 2;
+    // Position the true URL so a naive fixed-offset slice lands mid-URL:
+    // head = body.slice(0, room - 1) ends 11 chars inside the URL.
+    const body = `${'A'.repeat(room - 12)} ${URL} ${'B'.repeat(200)}`;
+    expect(body.length).toBeGreaterThan(room);
+    const out = normalizeCaption({ caption: body, source: SOURCE, url: URL });
+    expect(out.length).toBeLessThanOrEqual(MAX_CAPTION_CHARS);
+    expect(out.endsWith(required)).toBe(true);
+    // The stored body must carry either the whole URL or none of it: every
+    // URL-shaped token in the stored caption appears verbatim in the input
+    // (a mid-token cut would leave a `…`-suffixed fragment that matches
+    // /https?:\/\/\S*/ but is nowhere in the input).
+    for (const match of out.matchAll(/https?:\/\/\S*/g)) {
+      expect(body).toContain(match[0].replace(/…$/, ''));
+      expect(`${body}\n\n${required}`).toContain(match[0]);
+    }
+    // Here the URL is dropped whole from the body; only the canonical
+    // attribution link survives.
+    const links = out.match(/https?:\/\/\S+/gi) ?? [];
+    expect(links).toHaveLength(1);
+    expect(links[0]).toBe(URL);
+  });
 });
