@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canonicalizeUrl, hashCanonicalUrl } from './canonical.js';
+import { canonicalizeUrl, hashCanonicalUrl, isBlockedHost, isSafeWebUrl } from './canonical.js';
 
 describe('canonicalizeUrl', () => {
   it('lowercases scheme and host', () => {
@@ -56,7 +56,89 @@ describe('canonicalizeUrl', () => {
     expect(() => canonicalizeUrl('not a url')).toThrow(/invalid url/i);
     expect(() => canonicalizeUrl('')).toThrow(/invalid url/i);
   });
+
+  it('rejects URLs containing userinfo without echoing credentials', () => {
+    expect(() => canonicalizeUrl('https://user:pass@example.com/a')).toThrow(/invalid url/i);
+    expect(() => canonicalizeUrl('https://user@example.com/a')).toThrow(/invalid url/i);
+    let message = '';
+    try {
+      canonicalizeUrl('https://user:s3cret@example.com/a');
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).not.toContain('s3cret');
+    expect(message).not.toContain('user:');
+    expect(message).not.toContain('user@');
+  });
 });
+
+describe('isBlockedHost', () => {
+  it.each([
+    '127.0.0.1',
+    '127.0.0.2',
+    '10.0.0.5',
+    '10.255.255.255',
+    '172.16.0.1',
+    '172.31.255.255',
+    '192.168.1.1',
+    '169.254.169.254',
+    '169.254.0.1',
+    '0.0.0.0',
+    'localhost',
+    'LOCALHOST',
+    '::1',
+    '::',
+    'fe80::1',
+    'fc00::1',
+    'fd00::1',
+    '::ffff:192.168.1.1',
+    '::ffff:127.0.0.1',
+  ])('blocks %s', (host) => {
+    expect(isBlockedHost(host)).toBe(true);
+  });
+
+  it.each([
+    'example.com',
+    'www.ign.com',
+    '8.8.8.8',
+    '1.1.1.1',
+    '172.15.255.255',
+    '172.32.0.1',
+    '192.167.1.1',
+    '169.253.1.1',
+    '::ffff:8.8.8.8',
+    '2001:db8::1',
+  ])('allows public host %s', (host) => {
+    expect(isBlockedHost(host)).toBe(false);
+  });
+});
+
+describe('isSafeWebUrl', () => {
+  it('accepts ordinary public http(s) URLs', () => {
+    expect(isSafeWebUrl('https://example.com/a')).toBe(true);
+    expect(isSafeWebUrl('http://example.com:8080/a?b=1')).toBe(true);
+  });
+
+  it.each([
+    'ftp://example.com/a',
+    'javascript:alert(1)',
+    'file:///etc/passwd',
+    'not a url',
+    '',
+    'https://user:pass@example.com/a',
+    'http://192.168.1.1/admin',
+    'https://169.254.169.254/latest/meta-data/',
+    'http://localhost:3000/a',
+    'http://[::1]/a',
+  ])('rejects %s', (value) => {
+    expect(isSafeWebUrl(value)).toBe(false);
+  });
+
+  it('rejects non-string input', () => {
+    expect(isSafeWebUrl(null)).toBe(false);
+    expect(isSafeWebUrl(undefined)).toBe(false);
+    expect(isSafeWebUrl(42)).toBe(false);
+  });
 
 describe('hashCanonicalUrl', () => {
   it('returns a 64-char lowercase hex SHA-256', () => {
@@ -75,4 +157,5 @@ describe('hashCanonicalUrl', () => {
       hashCanonicalUrl('https://example.com/b'),
     );
   });
+});
 });

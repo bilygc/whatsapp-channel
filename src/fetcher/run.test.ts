@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyMigrations } from '../db/migrate.js';
-import { runFetch, type FetchDeps } from './run.js';
+import { defaultDeps, runFetch, type FetchDeps } from './run.js';
 import type { NewArticle } from './store.js';
 
 function openTestDb(): Database.Database {
@@ -178,5 +178,31 @@ describe('runFetch — per-source graceful degradation', () => {
       published_at: string;
     };
     expect(row.published_at).toBe('2026-10-17T12:00:00.000Z');
+  });
+});
+
+describe('defaultDeps', () => {
+  it('throws loudly (typed error) when NewsData is called without an API key', async () => {
+    const deps = defaultDeps(
+      { parseString: async () => ({ items: [] }) },
+      (async () => {
+        throw new Error('must not be called');
+      }) as unknown as typeof fetch,
+      undefined,
+    );
+    await expect(deps.fetchNewsData()).rejects.toThrow(
+      /newsdata fetch failed: NEWSDATA_API_KEY is not set/,
+    );
+  });
+
+  it('wires the API key through when present (no throw, typed per-source error on HTTP failure)', async () => {
+    const fetchFn = (async () => ({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+      json: async () => ({}),
+    })) as unknown as typeof fetch;
+    const deps = defaultDeps({ parseString: async () => ({ items: [] }) }, fetchFn, 'k');
+    await expect(deps.fetchNewsData()).rejects.toThrow(/newsdata fetch failed.*HTTP 401/);
   });
 });

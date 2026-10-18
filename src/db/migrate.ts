@@ -62,3 +62,11 @@ export function openDb(filePath: string): Database.Database {
 }
 
 export const DEFAULT_DB_PATH = path.join(process.cwd(), 'data', 'whatsapp-channel.db');
+
+/**
+ * Resolve the SQLite file path from the environment. Empty or whitespace-only
+ * DB_PATH falls back to the default — an unset-equivalent, never a crash.
+ */
+export function resolveDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.DB_PATH?.trim() || DEFAULT_DB_PATH;
+}

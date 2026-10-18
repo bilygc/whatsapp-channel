@@ -6,12 +6,12 @@
  */
 import Parser from 'rss-parser';
 import { config } from 'dotenv';
-import { DEFAULT_DB_PATH, applyMigrations, openDb } from '../db/migrate.js';
+import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
 import { defaultDeps, runFetch } from '../fetcher/run.js';
 
 config();
 
-const DB_PATH = process.env.DB_PATH ?? DEFAULT_DB_PATH;
+const DB_PATH = resolveDbPath();
 
 async function main(): Promise<void> {
   const db = openDb(DB_PATH);
@@ -30,7 +30,7 @@ async function main(): Promise<void> {
     const summary = await runFetch(
       db,
       defaultDeps(
-        (url: string) => parser.parseURL(url),
+        { parseString: (xml: string) => parser.parseString(xml) },
         fetch,
         apiKey,
       ),

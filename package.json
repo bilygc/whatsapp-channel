@@ -10,6 +10,7 @@
     "migrate": "tsx src/cli/migrate.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "audit": "npm audit --audit-level=high",
     "lint": "tsc --noEmit -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },

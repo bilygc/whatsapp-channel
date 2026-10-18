@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { canonicalizeUrl, hashCanonicalUrl } from './canonical.js';
+import { canonicalizeUrl, hashCanonicalUrl, isBlockedHost } from './canonical.js';
 
 export interface NewArticle {
   title: string;
@@ -24,6 +24,9 @@ const insertStmt = (db: Database.Database) =>
 /**
  * Insert an article, deduping on `url_hash` via the DB UNIQUE constraint.
  * Returns 'inserted' | 'skipped' (duplicate) | 'invalid' (bad URL — never throws).
+ * URLs with userinfo or denylisted (non-public) hosts are 'invalid': this is
+ * an ingest-time filter for obvious cases only — it cannot stop DNS rebinding
+ * (see the NOTE on isBlockedHost; M2 fetch-time resolution must enforce it).
  * Unexpected SQLite errors (e.g. SQLITE_BUSY after the busy timeout) propagate
  * to the caller, which treats them as a per-source failure.
  */
@@ -31,7 +34,8 @@ export function insertArticle(db: Database.Database, article: NewArticle): Inser
   let urlHash: string;
   try {
     // Validate first so a malformed URL is 'invalid', not an unhandled throw.
-    canonicalizeUrl(article.url);
+    const canonical = canonicalizeUrl(article.url);
+    if (isBlockedHost(new URL(canonical).hostname)) return 'invalid';
     urlHash = hashCanonicalUrl(article.url);
   } catch {
     return 'invalid';

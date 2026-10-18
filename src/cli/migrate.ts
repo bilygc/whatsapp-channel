@@ -1,8 +1,11 @@
 #!/usr/bin/env tsx
 /** `npm run migrate` — apply pending migrations in src/db/migrations/. */
-import { DEFAULT_DB_PATH, applyMigrations, openDb } from '../db/migrate.js';
+import { config } from 'dotenv';
+import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
 
-const DB_PATH = process.env.DB_PATH ?? DEFAULT_DB_PATH;
+config();
+
+const DB_PATH = resolveDbPath();
 
 const db = openDb(DB_PATH);
 try {

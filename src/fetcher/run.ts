@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import { NEWSDATA_QUERY, RSS_SOURCES } from './feeds.js';
 import { fetchNewsDataSource } from './newsdata.js';
-import { fetchRssSource } from './rss.js';
+import { fetchRssSource, type RssDeps } from './rss.js';
 import { insertArticle, type NewArticle } from './store.js';
 
 export interface SourceResult {
@@ -32,7 +32,7 @@ export interface FetchDeps {
 }
 
 export function defaultDeps(
-  parseURL: (url: string) => Promise<{ items?: unknown[] }>,
+  parser: { parseString: RssDeps['parseString'] },
   fetchFn: typeof fetch,
   apiKey: string | undefined,
 ): FetchDeps {
@@ -42,15 +42,21 @@ export function defaultDeps(
     now,
     fetchRss: (source) =>
       fetchRssSource(source, {
-        // rss-parser's parseURL returns its own Output type; cast through unknown.
-        parseURL: parseURL as Parameters<typeof fetchRssSource>[1]['parseURL'],
+        fetchFn,
+        parseString: parser.parseString,
         now: now(),
       }),
-    fetchNewsData: () =>
-      fetchNewsDataSource(
-        { apiKey: apiKey as string, query: NEWSDATA_QUERY },
+    fetchNewsData: async () => {
+      // runFetch skips NewsData when the key is missing, so reaching here
+      // means a wiring bug — throw loudly instead of sending `undefined`.
+      if (!apiKey) {
+        throw new Error('newsdata fetch failed: NEWSDATA_API_KEY is not set');
+      }
+      return fetchNewsDataSource(
+        { apiKey, query: NEWSDATA_QUERY },
         { fetchFn, now: now() },
-      ),
+      );
+    },
     newsDataApiKey: apiKey,
   };
 }

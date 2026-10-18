@@ -81,6 +81,20 @@ describe('insertArticle (dedupe by url_hash)', () => {
     expect(db.prepare('SELECT COUNT(*) AS n FROM articles').get()).toMatchObject({ n: 0 });
   });
 
+  it.each([
+    'https://user:pass@example.com/news/1',
+    'http://192.168.1.10/internal',
+    'http://10.0.0.5/x',
+    'https://169.254.169.254/latest/meta-data/',
+    'http://localhost:3000/x',
+    'http://[::1]/x',
+  ])('rejects non-public article URL %s as invalid (never throws, never stores)', (url) => {
+    const db = openTestDb();
+    dbs.push(db);
+    expect(insertArticle(db, article({ url }))).toBe('invalid');
+    expect(db.prepare('SELECT COUNT(*) AS n FROM articles').get()).toMatchObject({ n: 0 });
+  });
+
   it('stores NULL image_url when no image is available', () => {
     const db = openTestDb();
     dbs.push(db);
