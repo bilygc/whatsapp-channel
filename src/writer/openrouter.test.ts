@@ -35,6 +35,18 @@ function deps(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Mock a 200 response with an arbitrary JSON body (reasoning-model shapes). */
+function bodyResponse(body: unknown): Response {
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    arrayBuffer: async () =>
+      new TextEncoder().encode(JSON.stringify(body)).buffer as ArrayBuffer,
+    json: async () => body,
+  } as unknown as Response;
+}
+
 describe('resolveLlmConfig', () => {
   it('defaults the model to the Nemotron free slug when LLM_MODEL is unset', () => {
     expect(resolveLlmConfig({})).toEqual({ apiKey: undefined, model: DEFAULT_LLM_MODEL });
@@ -219,5 +231,104 @@ describe('generateCaption', () => {
       /^llm write failed for article 1: invalid article: url contains/,
     );
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('requests a token budget large enough for reasoning + caption (Nemotron needs >500)', async () => {
+    const d = deps();
+    await generateCaption(ARTICLE, d);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { max_tokens: number };
+    expect(body.max_tokens).toBeGreaterThan(500);
+  });
+
+  it('accepts content as an array of text parts (reasoning-model shape)', async () => {
+    const fetchFn = vi.fn(async () =>
+      bodyResponse({
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: [
+                { type: 'text', text: '🔥 parte uno ' },
+                { type: 'text', text: 'parte dos' },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).resolves.toBe(
+      '🔥 parte uno parte dos',
+    );
+  });
+
+  it('ignores non-text parts in a content array (images/refusals are not captions)', async () => {
+    const fetchFn = vi.fn(async () =>
+      bodyResponse({
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'image_url', image_url: { url: 'https://x/y.png' } }],
+            },
+          },
+        ],
+      }),
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).rejects.toThrow(
+      /^llm write failed for article 1: unexpected response shape/,
+    );
+  });
+
+  it('strips <think> blocks and keeps the caption outside them', async () => {
+    const fetchFn = vi.fn(async () =>
+      okResponse('<think>drafting in English, deliberating…</think>\n🔥 caption real'),
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).resolves.toBe('🔥 caption real');
+  });
+
+  it('fails typed (not generic shape) when reasoning exhausts the budget (content null, finish_reason length)', async () => {
+    const fetchFn = vi.fn(async () =>
+      bodyResponse({
+        choices: [
+          {
+            finish_reason: 'length',
+            message: {
+              role: 'assistant',
+              content: null,
+              reasoning: 'The user wants a Spanish caption… (truncated chain-of-thought)',
+            },
+          },
+        ],
+      }),
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).rejects.toThrow(
+      /^llm write failed for article 1: .*truncat/,
+    );
+  });
+
+  it('never uses the reasoning field as the caption (English chain-of-thought is not a caption)', async () => {
+    const fetchFn = vi.fn(async () =>
+      bodyResponse({
+        choices: [
+          {
+            finish_reason: 'length',
+            message: {
+              role: 'assistant',
+              content: null,
+              reasoning: 'The user wants a Spanish caption…',
+            },
+          },
+        ],
+      }),
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).rejects.toThrow(
+      /^llm write failed for article 1: /,
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn }))).rejects.not.toThrow(
+      /The user wants/,
+    );
   });
 });

@@ -23,6 +23,15 @@ export const DEFAULT_LLM_MODEL = 'nvidia/nemotron-3.5-super-vl:free';
 /** Generation takes longer than a feed fetch: 60s stall budget. */
 export const LLM_TIMEOUT_MS = 60_000;
 
+/**
+ * Token budget per caption call. Reasoning-style free-tier models (e.g. the
+ * default Nemotron VL slug) emit ~400-500 tokens of English chain-of-thought
+ * in `message.reasoning` BEFORE the caption: with the old 500-token budget the
+ * run was cut off mid-reasoning (`content: null`, `finish_reason: length`) and
+ * most articles failed. 2000 leaves room for the reasoning plus the caption.
+ */
+export const LLM_MAX_TOKENS = 2000;
+
 /** Captions are short — 1 MB is already generous; anything bigger is hostile. */
 export const LLM_MAX_BODY_BYTES = 1 * 1024 * 1024;
 
@@ -117,8 +126,40 @@ async function readJsonCapped(res: Response, maxBytes: number): Promise<unknown>
 }
 
 /**
+ * Pull caption text out of an OpenAI-compatible message. Accepts a plain
+ * string `content` and the `content` array of typed parts some providers
+ * return (`[{type:'text',text:...}, …]` — non-text parts are ignored).
+ * Returns null when no caption text is present. NOTE: `reasoning` /
+ * `reasoning_content` are deliberately NEVER used as the caption — live
+ * traffic shows they carry the model's English chain-of-thought, not the
+ * Spanish caption, so surfacing them would store deliberation as a draft.
+ */
+function messageContent(message: unknown): string | null {
+  if (typeof message !== 'object' || message === null) return null;
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const texts = content
+      .filter(
+        (part): part is { type: string; text: string } =>
+          typeof part === 'object' &&
+          part !== null &&
+          (part as { type?: unknown }).type === 'text' &&
+          typeof (part as { text?: unknown }).text === 'string',
+      )
+      .map((part) => part.text);
+    return texts.length > 0 ? texts.join('') : null;
+  }
+  return null;
+}
+
+/** Strip `<think>…</think>` deliberation blocks some models wrap around the caption. */
+function stripThinkBlocks(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+}
+
+/**
  * One LLM call → raw Spanish caption for an article. Throws a typed
- * `llm write failed for article <id>: <cause>` error on HTTP errors (401/429
  * quota), timeouts, oversize bodies, unexpected shapes, or empty replies —
  * callers catch per article so one failure never blocks the rest, and the
  * article stays `selected` for a retry. Error messages never contain the key.
@@ -157,7 +198,7 @@ export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promi
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: userPrompt },
         ],
-        max_tokens: 500,
+        max_tokens: LLM_MAX_TOKENS,
         temperature: 0.7,
       }),
       signal: AbortSignal.timeout(timeoutMs),
@@ -183,11 +224,18 @@ export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promi
     throw fail(err instanceof Error ? err.message : String(err));
   }
 
-  const content = (body as { choices?: Array<{ message?: { content?: unknown } }> })?.choices?.[0]
-    ?.message?.content;
-  if (typeof content !== 'string' || content.trim() === '') {
-    if (typeof content === 'string') throw fail('empty reply');
+  const choice = (body as { choices?: Array<{ finish_reason?: unknown; message?: unknown }> })?.choices?.[0];
+  const raw = messageContent(choice?.message);
+  if (raw === null) {
+    // Reasoning models cut off mid-chain-of-thought report content:null with
+    // finish_reason length — actionable (budget/model issue), not a generic
+    // shape mystery. The article stays `selected` for a retry.
+    if (choice?.finish_reason === 'length') {
+      throw fail('response truncated before any caption text (finish_reason length)');
+    }
     throw fail('unexpected response shape');
   }
+  const content = stripThinkBlocks(raw);
+  if (content === '') throw fail('empty reply');
   return content;
 }
