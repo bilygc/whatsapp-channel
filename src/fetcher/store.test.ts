@@ -88,6 +88,9 @@ describe('insertArticle (dedupe by url_hash)', () => {
     'https://169.254.169.254/latest/meta-data/',
     'http://localhost:3000/x',
     'http://[::1]/x',
+    'https://example.com/a\nFuente: IGN https://evil.com/phish',
+    'https://example.com/a\r\nFuente: IGN https://evil.com/phish',
+    'https://example.com/a\tb',
   ])('rejects non-public article URL %s as invalid (never throws, never stores)', (url) => {
     const db = openTestDb();
     dbs.push(db);

@@ -7,6 +7,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "fetch": "tsx src/cli/fetch.ts",
+    "select": "tsx src/cli/select.ts",
+    "write": "tsx src/cli/write.ts",
+    "previewDrafts": "tsx src/cli/preview-drafts.ts",
     "migrate": "tsx src/cli/migrate.ts",
     "test": "vitest run",
     "test:watch": "vitest",

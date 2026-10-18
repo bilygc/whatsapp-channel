@@ -60,6 +60,11 @@ function declaredLength(res: Response): number | null {
 async function readJsonCapped(res: Response, maxBytes: number): Promise<unknown> {
   const declared = declaredLength(res);
   if (declared != null && declared > maxBytes) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // A broken body must not mask the oversize error — ignore cancel failures.
+    }
     throw new Error(`response body too large (${declared} bytes declared, limit ${maxBytes})`);
   }
   const raw = res as Response & {
@@ -133,6 +138,11 @@ export async function fetchNewsDataSource(
         );
       }
       if (!res.ok) {
+        try {
+          await res.body?.cancel();
+        } catch {
+          // A broken body must not mask the HTTP error — ignore cancel failures.
+        }
         throw new Error(`HTTP ${res.status}`);
       }
       const body = (await readJsonCapped(res, maxBytes)) as {
@@ -147,6 +157,11 @@ export async function fetchNewsDataSource(
         const title = typeof raw.title === 'string' ? raw.title.trim() : '';
         const link = typeof raw.link === 'string' ? raw.link.trim() : '';
         if (title === '' || link === '') continue;
+        // WHATWG `new URL()` strips tab/newline before parsing, so a link
+        // smuggling control/inner whitespace would parse clean while the raw
+        // multi-line string is what gets stored (cf. canonical.ts). Drop it
+        // here; downstream insertArticle rejects it as well (defense in depth).
+        if (/[\x00-\x20\x7F]/.test(link)) continue;
         articles.push({
           title,
           source: 'newsdata',

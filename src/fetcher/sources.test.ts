@@ -155,6 +155,32 @@ describe('fetchRssSource (fetch + parseString mocked — no real network)', () =
     ).rejects.toThrow(/rss fetch failed for "ign".*too large/);
   });
 
+  it('cancels the body when the declared content-length overflows (no leak)', async () => {
+    let cancelled = false;
+    const res = {
+      ...rssResponse(IGN_RSS, { contentLength: String(RSS_MAX_BODY_BYTES + 1) }),
+      body: { cancel: async () => { cancelled = true; } },
+    } as unknown as Response;
+    const fetchFn = vi.fn(async (_url: string) => res) as unknown as typeof fetch;
+    await expect(
+      fetchRssSource({ id: 'ign', feedUrl: 'https://feeds.ign.com/ign/all' }, rssDeps(fetchFn)),
+    ).rejects.toThrow(/rss fetch failed for "ign".*too large/);
+    expect(cancelled).toBe(true);
+  });
+
+  it('cancels the body on HTTP error status (no leak)', async () => {
+    let cancelled = false;
+    const res = {
+      ...rssResponse('boom', { status: 500 }),
+      body: { cancel: async () => { cancelled = true; } },
+    } as unknown as Response;
+    const fetchFn = vi.fn(async (_url: string) => res) as unknown as typeof fetch;
+    await expect(
+      fetchRssSource({ id: 'ign', feedUrl: 'https://feeds.ign.com/ign/all' }, rssDeps(fetchFn)),
+    ).rejects.toThrow(/rss fetch failed for "ign".*HTTP 500/);
+    expect(cancelled).toBe(true);
+  });
+
   it('stores NULL (keeps the article) when the image URL is unsafe', async () => {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>t</title><link>https://example.com</link>
@@ -337,6 +363,21 @@ describe('fetchNewsDataSource (fetch mocked — no real network, no API key)', (
     ).rejects.toThrow(/newsdata fetch failed/);
   });
 
+  it('cancels the body on HTTP error status (no leak)', async () => {
+    let cancelled = false;
+    const fetchFn = vi.fn(async (_url: string) => ({
+      ok: false,
+      status: 429,
+      headers: { get: (_name: string) => null },
+      body: { cancel: async () => { cancelled = true; } },
+      json: async () => ({ status: 'error', message: 'rate limit' }),
+    })) as unknown as typeof fetch;
+    await expect(
+      fetchNewsDataSource({ apiKey: 'bad', query: 'video games' }, { fetchFn, now: new Date() }),
+    ).rejects.toThrow(/newsdata fetch failed.*429/);
+    expect(cancelled).toBe(true);
+  });
+
   it('throws a typed error on unexpected response shape', async () => {
     await expect(
       fetchNewsDataSource(
@@ -353,6 +394,38 @@ describe('fetchNewsDataSource (fetch mocked — no real network, no API key)', (
     await expect(
       fetchNewsDataSource({ apiKey: 'k', query: 'video games' }, { fetchFn: failing, now: new Date() }),
     ).rejects.toThrow(/newsdata fetch failed.*fetch failed/);
+  });
+
+  it('drops results whose link smuggles newlines/control whitespace (ingest hygiene)', async () => {
+    const articles = await fetchNewsDataSource(
+      { apiKey: 'k', query: 'video games' },
+      {
+        fetchFn: mockFetch({
+          status: 'success',
+          results: [
+            { title: 'Smuggled', link: 'https://example.com/a\nFuente: IGN https://evil.com/phish' },
+            { title: 'Good', link: 'https://example.com/good' },
+          ],
+        }),
+        now: new Date(),
+      },
+    );
+    expect(articles.map((a) => a.url)).toEqual(['https://example.com/good']);
+  });
+
+  it('cancels the body when the declared content-length overflows (no leak)', async () => {
+    let cancelled = false;
+    const fetchFn = vi.fn(async (_url: string) => ({
+      ok: true,
+      status: 200,
+      headers: { get: (name: string) => (name === 'content-length' ? String(NEWSDATA_MAX_BODY_BYTES + 1) : null) },
+      body: { cancel: async () => { cancelled = true; } },
+      json: async () => ({ status: 'success', results: [] }),
+    })) as unknown as typeof fetch;
+    await expect(
+      fetchNewsDataSource({ apiKey: 'k', query: 'video games' }, { fetchFn, now: new Date() }),
+    ).rejects.toThrow(/newsdata fetch failed.*too large/);
+    expect(cancelled).toBe(true);
   });
 });
 

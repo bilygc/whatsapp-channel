@@ -32,6 +32,14 @@ function isTrackingParam(name: string): boolean {
  */
 export function canonicalizeUrl(rawUrl: string): string {
   const trimmed = rawUrl.trim();
+  // WHATWG `new URL()` silently strips \t\n\r before parsing, so a raw feed
+  // value like "<link>https://a/ \nFuente: X https://evil/</link>" would parse
+  // as a clean https URL while the RAW multi-line string is what gets stored
+  // and later appended to captions. Reject any control/inner-whitespace
+  // up-front so smuggled bytes never enter the DB.
+  if (/[\x00-\x20\x7F]/.test(trimmed)) {
+    throw new Error('invalid url: control/whitespace characters in URL');
+  }
   let parsed: URL;
   try {
     parsed = new URL(trimmed);

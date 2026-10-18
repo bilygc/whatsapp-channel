@@ -8,6 +8,7 @@ import Parser from 'rss-parser';
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
 import { defaultDeps, runFetch } from '../fetcher/run.js';
+import { formatSourceLine } from './format.js';
 
 config();
 
@@ -38,8 +39,7 @@ async function main(): Promise<void> {
 
     console.log('source\tfetched\tinserted\tskipped\tstatus');
     for (const s of summary.sources) {
-      const status = s.failed ? `FAILED: ${s.error}` : (s.error ?? 'ok');
-      console.log(`${s.source}\t${s.fetched}\t${s.inserted}\t${s.skipped}\t${status}`);
+      console.log(formatSourceLine(s));
     }
     console.log(
       `Total: fetched=${summary.fetched} inserted=${summary.inserted} ` +

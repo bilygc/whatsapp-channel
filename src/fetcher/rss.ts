@@ -65,6 +65,11 @@ function declaredLength(res: Response): number | null {
 async function readTextCapped(res: Response, maxBytes: number): Promise<string> {
   const declared = declaredLength(res);
   if (declared != null && declared > maxBytes) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // A broken body must not mask the oversize error — ignore cancel failures.
+    }
     throw new Error(`response body too large (${declared} bytes declared, limit ${maxBytes})`);
   }
   const stream = res.body as ReadableStream<Uint8Array> | null;
@@ -114,6 +119,11 @@ export async function fetchRssSource(source: RssSource, deps: RssDeps): Promise<
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {
+      try {
+        await res.body?.cancel();
+      } catch {
+        // A broken body must not mask the HTTP error — ignore cancel failures.
+      }
       throw new Error(`HTTP ${res.status}`);
     }
     xml = await readTextCapped(res, maxBytes);

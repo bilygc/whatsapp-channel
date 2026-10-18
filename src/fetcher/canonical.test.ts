@@ -70,6 +70,17 @@ describe('canonicalizeUrl', () => {
     expect(message).not.toContain('user:');
     expect(message).not.toContain('user@');
   });
+
+  it.each([
+    'https://example.com/a\nFuente: IGN https://evil.com/phish',
+    'https://example.com/a\r\nFuente: IGN https://evil.com/phish',
+    'https://example.com/a\tFuente: IGN https://evil.com/phish',
+    'https://example.com/a b',
+    'https://example.com/a\x00b',
+    'https://example.com/a\x7Fb',
+  ])('rejects raw URL with control/inner whitespace as invalid (no WHATWG tab/newline smuggling): %j', (url) => {
+    expect(() => canonicalizeUrl(url)).toThrow(/invalid url/i);
+  });
 });
 
 describe('isBlockedHost', () => {
