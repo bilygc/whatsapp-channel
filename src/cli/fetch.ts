@@ -8,7 +8,7 @@ import Parser from 'rss-parser';
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
 import { defaultDeps, runFetch } from '../fetcher/run.js';
-import { formatSourceLine } from './format.js';
+import { formatCliFailure, formatSourceLine } from './format.js';
 
 config();
 
@@ -52,6 +52,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  console.error('fetch failed:', err instanceof Error ? err.message : err);
+  // Sanitized printing (terminal-escape scrub + newsdata key redaction):
+  // fetcher errors can echo key-bearing request details or feed bytes.
+  console.error(formatCliFailure('fetch', err, process.env.NEWSDATA_API_KEY ?? ''));
   process.exitCode = 1;
 });

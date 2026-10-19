@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_CAPTION_CHARS, normalizeCaption, scrub } from './validate.js';
+import { MAX_CAPTION_CHARS, normalizeCaption, scrub, scrubToLine } from './validate.js';
 
 const SOURCE = 'IGN';
 const URL = 'https://example.com/elden-ring-dlc';
@@ -189,11 +189,34 @@ describe('normalizeCaption', () => {
   });
 
   it('exports a scrub() helper that strips ESC/control sequences for terminal-safe printing', () => {
-    const dirty = '\u001B[2K\u001B[1G\u0007Spoofed title\u001B[0m https://example.com/a\x00\x1F';
+    const dirty =
+      'Real title\u001B[0m \u001B]0;spoof\u0007 https://example.com/a\x00\x1F';
     const clean = scrub(dirty);
     expect(clean).not.toContain('\u001B');
+    expect(clean).not.toContain(']0;');
+    expect(clean).not.toContain('spoof');
     expect(clean).not.toMatch(/[\x00-\x1F\x7F-\x9F]/);
-    expect(clean).toContain('Spoofed title');
+    // Legitimate text around the codes survives (codes are stripped, not words).
+    expect(clean).toContain('Real title');
+  });
+
+  it('strips a full OSC window-title spoof leaving no payload text behind', () => {
+    expect(scrub('a\u001B]0;spoof\u0007b')).toBe('ab');
+    expect(scrub('a\u001B]0;spoof\u001B\\b')).toBe('ab');
+    const clean = scrub('x \u001B]0;spoof\u0007 y');
+    expect(clean).not.toContain(']0;');
+    expect(clean).not.toContain('spoof');
+  });
+
+  it('exports a scrubToLine() helper that collapses a newline-forged title to one line', () => {
+    // A hostile feed title smuggling fake terminal lines (and an OSC spoof):
+    // scrub() alone keeps \n, so CLI log lines use scrubToLine instead.
+    const forged = 'Nice game\n0 6 * * * /usr/bin/evil\n\u001B]0;spoof\u0007#Videojuegos';
+    const oneLine = scrubToLine(forged);
+    expect(oneLine).not.toContain('\n');
+    expect(oneLine).not.toContain('\u001B');
+    expect(oneLine).toBe('Nice game 0 6 * * * /usr/bin/evil #Videojuegos');
+    expect(scrubToLine('plain title')).toBe('plain title');
   });
 
   it('link-swap guard covers every linkable class (scheme, www, bare domain, ftp, mailto)', () => {

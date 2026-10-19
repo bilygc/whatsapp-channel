@@ -6,7 +6,8 @@
  */
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
-import { scrub } from '../writer/validate.js';
+import { scrub, scrubToLine } from '../writer/validate.js';
+import { formatCliFailure } from './format.js';
 
 config();
 
@@ -57,11 +58,11 @@ async function main(): Promise<void> {
     }
     for (const row of rows) {
       console.log(`=== draft ${row.id} [${row.status}] (${row.created_at}) ===`);
-      // Feed fields are remote-controlled: scrub terminal-escape/control
-      // sequences so a hostile title cannot spoof terminal output and
-      // undermine the human review gate (display-only; the DB is untouched).
-      console.log(`Article: ${scrub(row.title)}`);
-      console.log(`Source: ${scrub(row.source)} ${scrub(row.url)}`);
+      // Feed fields are remote-controlled: single-line scrub so a hostile
+      // title cannot forge extra terminal lines past the review gate
+      // (display-only; the DB is untouched).
+      console.log(`Article: ${scrubToLine(row.title)}`);
+      console.log(`Source: ${scrubToLine(row.source)} ${scrubToLine(row.url)}`);
       console.log('--- caption (paste-ready) ---');
       console.log(scrub(row.caption_es));
       console.log();
@@ -75,6 +76,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  console.error('previewDrafts failed:', err instanceof Error ? err.message : err);
+  // No secrets on this path — sanitized printing is still worth it: drafts
+  // carry feed-controlled bytes.
+  console.error(formatCliFailure('previewDrafts', err, ''));
   process.exitCode = 1;
 });

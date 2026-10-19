@@ -430,13 +430,16 @@ describe('fetchNewsDataSource (fetch mocked — no real network, no API key)', (
 });
 
 describe('migration runner', () => {
-  it('applies 0001_init.sql to a fresh DB and sets user_version=1 (idempotent)', async () => {
+  it('applies all migrations to a fresh DB and sets user_version accordingly (idempotent)', async () => {
     const { applyMigrations, getUserVersion } = await import('../db/migrate.js');
     const db = new Database(':memory:');
     try {
       const appliedFirst = applyMigrations(db);
       expect(appliedFirst).toContain('0001_init.sql');
-      expect(getUserVersion(db)).toBe(1);
+      expect(appliedFirst).toContain('0002_draft_send_tracking.sql');
+      // user_version tracks the migration count (one file per version).
+      expect(getUserVersion(db)).toBe(appliedFirst.length);
+      expect(getUserVersion(db)).toBe(2);
       expect(
         db.prepare(`SELECT name FROM sqlite_master WHERE name = 'articles'`).get(),
       ).toBeTruthy();

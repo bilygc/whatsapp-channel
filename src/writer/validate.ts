@@ -28,6 +28,15 @@ const INVISIBLE_RE = /[\u200B-\u200F\u2060\uFEFF\u202A-\u202E\u2028\u2029\u00AD\
 /** ANSI escape sequences (e.g. SGR color codes) — never part of a caption. */
 const ANSI_RE = /\u001B\[[0-?]*[ -\/]*[@-~]/g;
 
+/**
+ * OSC (Operating System Command) sequences (`ESC ] … BEL` / `ESC ] … ESC \`,
+ * e.g. window-title spoofing). Stripped BEFORE the generic control-character
+ * pass in scrub(): CONTROL_RE would eat the ESC introducer and the BEL
+ * terminator first, leaving the payload text (`]0;spoof`) behind as if it
+ * were legitimate content.
+ */
+const OSC_RE = /\u001B\][^\x07]*(?:\x07|\u001B\\)/g;
+
 /** Lines the model may have used as its own (possibly mangled) attribution. */
 function isAttributionLine(line: string): boolean {
   return /^fuente\s*:/i.test(line.trim());
@@ -41,7 +50,20 @@ function isAttributionLine(line: string): boolean {
  * overwrite terminal output and undermine the human review gate).
  */
 export function scrub(text: string): string {
-  return text.replace(ANSI_RE, '').replace(CONTROL_RE, '').replace(INVISIBLE_RE, '');
+  return text.replace(OSC_RE, '').replace(ANSI_RE, '').replace(CONTROL_RE, '').replace(INVISIBLE_RE, '');
+}
+
+/**
+ * Single-line variant of `scrub()` for feed-controlled fields printed to a
+ * terminal (titles, sources, URLs in CLI log lines). `scrub()` deliberately
+ * keeps `\n` as the line separator, so a hostile title like
+ * `Nice game\n0 6 * * * evil` would still forge extra terminal lines and
+ * undermine the human review gate — collapsing every whitespace run to one
+ * space keeps the printed line to exactly one line (display-only; the DB is
+ * untouched).
+ */
+export function scrubToLine(text: string): string {
+  return scrub(text).replace(/\s+/g, ' ');
 }
 
 /**

@@ -7,7 +7,8 @@
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
 import { SELECT_DEFAULT_LIMIT, selectTopArticles } from '../selector/select.js';
-import { scrub } from '../writer/validate.js';
+import { scrubToLine } from '../writer/validate.js';
+import { formatCliFailure } from './format.js';
 
 config();
 
@@ -26,9 +27,9 @@ async function main(): Promise<void> {
     const { selected, scored } = selectTopArticles(db, { limit });
     console.log(`Scored ${scored} new article(s); selected ${selected.length} (limit ${limit}).`);
     for (const a of selected) {
-      // Feed fields are remote-controlled: scrub terminal-escape/control
-      // sequences so a hostile title cannot spoof terminal output.
-      console.log(`- [${a.id}] ${scrub(a.source)}: ${scrub(a.title)} (${scrub(a.url)})`);
+      // Feed fields are remote-controlled: single-line scrub so a hostile
+      // title cannot forge extra terminal lines past the review gate.
+      console.log(`- [${a.id}] ${scrubToLine(a.source)}: ${scrubToLine(a.title)} (${scrubToLine(a.url)})`);
     }
   } catch (err) {
     console.error(`select failed: ${err instanceof Error ? err.message : err}`);
@@ -39,6 +40,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  console.error('select failed:', err instanceof Error ? err.message : err);
+  // No secrets on this path — sanitized printing is still worth it: selector
+  // errors can echo feed-controlled bytes.
+  console.error(formatCliFailure('select', err, ''));
   process.exitCode = 1;
 });

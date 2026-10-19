@@ -175,6 +175,35 @@ describe('method wrappers', () => {
     expect(body).not.toHaveProperty('parse_mode');
   });
 
+  it('sendMessage throws a typed error when the result lacks a safe-integer message_id', async () => {
+    for (const result of [{}, { message_id: undefined }, { message_id: '7' }, null, 'ok']) {
+      const d = deps({
+        fetchFn: vi.fn(async () => jsonResponse({ ok: true, result })),
+      });
+      const err = await sendMessage({ chatId: '123', text: 'hi' }, d, 'draft 3').catch((e) => e);
+      expect(err).toBeInstanceOf(TelegramApiError);
+      expect((err as Error).message).toMatch(
+        /^telegram sendMessage failed for draft 3: unexpected response shape/,
+      );
+      expect((err as Error).message).not.toContain(TOKEN);
+    }
+  });
+
+  it('sendPhoto throws a typed error when the result lacks a safe-integer message_id', async () => {
+    const d = deps({
+      fetchFn: vi.fn(async () => jsonResponse({ ok: true, result: { message_id: 7.5 } })),
+    });
+    const err = await sendPhoto(
+      { chatId: '123', text: 'caption', photoUrl: 'https://img.example/x.jpg' },
+      d,
+      'draft 4',
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(TelegramApiError);
+    expect((err as Error).message).toMatch(
+      /^telegram sendPhoto failed for draft 4: unexpected response shape/,
+    );
+  });
+
   it('getUpdates forwards offset/limit/timeout pagination', async () => {
     const d = deps({
       fetchFn: vi.fn(async () => jsonResponse({ ok: true, result: [] })),

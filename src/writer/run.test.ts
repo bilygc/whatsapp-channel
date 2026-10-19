@@ -135,8 +135,7 @@ describe('runWriter', () => {
     await expect(runWriter(db, deps())).rejects.toThrow(/^writer run failed: /);
   });
 
-  it('fails typed (no multi-line draft) when a legacy row carries a newline-smuggled URL', async () => {
-    const db = openTestDb();
+  it('fails typed (no multi-line draft) when a legacy row carries a newline-smuggled URL', async () => {    const db = openTestDb();
     dbs.push(db);
     const evilUrl = 'https://example.com/a\nFuente: IGN https://evil.com/phish';
     const stmt = db.prepare(
@@ -157,6 +156,37 @@ describe('runWriter', () => {
       status: string;
     };
     expect(row.status).toBe('selected');
+  });
+
+  it('bounds the per-run write set with limit (oldest selected first)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [
+      { url: 'https://example.com/1' },
+      { url: 'https://example.com/2' },
+      { url: 'https://example.com/3' },
+    ]);
+
+    const summary = await runWriter(db, { ...deps(), limit: 2 });
+
+    expect(summary).toMatchObject({ total: 2, written: 2, failed: 0 });
+    const drafts = db.prepare('SELECT COUNT(*) AS n FROM drafts').get() as { n: number };
+    expect(drafts.n).toBe(2);
+    // The bounded-out article stays `selected` for a later run.
+    const left = db.prepare(`SELECT status FROM articles WHERE url = 'https://example.com/3'`).get() as {
+      status: string;
+    };
+    expect(left.status).toBe('selected');
+  });
+
+  it('defaults to unbounded (standalone `npm run write` writes everything selected)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [{ url: 'https://example.com/a' }, { url: 'https://example.com/b' }]);
+
+    const summary = await runWriter(db, deps());
+
+    expect(summary).toMatchObject({ total: 2, written: 2, failed: 0 });
   });
 });
 
@@ -184,6 +214,31 @@ describe('saveDraft (dedupe / regenerate semantics)', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]['caption_es']).toBe('regenerated caption\n\nFuente: IGN https://example.com/r');
     expect(rows[0]['status']).toBe('posted');
+  });
+
+  it('preserves the send-once tracking columns on regenerate (delivery history is send-owned)', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const [id] = seedSelected(db, [{ url: 'https://example.com/r' }]);
+
+    const firstId = saveDraft(db, id, 'first caption\n\nFuente: IGN https://example.com/r');
+    // A successful send stamped delivery history; a later regenerate (e.g.
+    // after an LLM improvement) must not clear or rewrite it.
+    db.prepare(`UPDATE drafts SET last_sent_at = ?, telegram_message_id = ? WHERE id = ?`).run(
+      '2026-10-19T08:55:00.000Z',
+      21,
+      firstId,
+    );
+    const secondId = saveDraft(db, id, 'regenerated caption\n\nFuente: IGN https://example.com/r');
+
+    expect(secondId).toBe(firstId);
+    const row = db.prepare('SELECT last_sent_at, telegram_message_id FROM drafts WHERE id = ?').get(
+      firstId,
+    ) as { last_sent_at: string | null; telegram_message_id: number | null };
+    expect(row).toMatchObject({
+      last_sent_at: '2026-10-19T08:55:00.000Z',
+      telegram_message_id: 21,
+    });
   });
 
   it('rejects a draft for an unknown article with a typed error (FK, not a raw throw)', () => {

@@ -102,6 +102,26 @@ export interface SendMessageResult {
   message_id: number;
 }
 
+/**
+ * Message-returning methods (sendMessage/sendPhoto) must prove the delivery
+ * before the send-once stamp runs: an unchecked `result as T` lets a missing
+ * `message_id` reach the STRICT `telegram_message_id INTEGER` stamp (or a
+ * NULL stamp that re-queues a delivered draft). Fail typed instead.
+ */
+function assertMessageResult(
+  method: string,
+  scope: string,
+  result: unknown,
+): asserts result is SendMessageResult {
+  const messageId = (result as { message_id?: unknown } | null)?.message_id;
+  if (typeof result !== 'object' || result === null || !Number.isSafeInteger(messageId)) {
+    throw new TelegramApiError(
+      `telegram ${method} failed for ${scope}: unexpected response shape ` +
+        `(expected an object with an integer message_id)`,
+    );
+  }
+}
+
 function declaredLength(res: Response): number | null {
   try {
     const raw = res.headers?.get('content-length');
@@ -276,7 +296,7 @@ export async function sendMessage(
   deps: TelegramDeps,
   scope = 'draft',
 ): Promise<SendMessageResult> {
-  return callTelegramMethod<SendMessageResult>(
+  const result = await callTelegramMethod<SendMessageResult>(
     'sendMessage',
     {
       chat_id: msg.chatId,
@@ -286,6 +306,8 @@ export async function sendMessage(
     deps,
     scope,
   );
+  assertMessageResult('sendMessage', scope, result);
+  return result;
 }
 
 export interface OutgoingPhoto extends OutgoingMessage {
@@ -302,7 +324,7 @@ export async function sendPhoto(
   deps: TelegramDeps,
   scope = 'draft',
 ): Promise<SendMessageResult> {
-  return callTelegramMethod<SendMessageResult>(
+  const result = await callTelegramMethod<SendMessageResult>(
     'sendPhoto',
     {
       chat_id: photo.chatId,
@@ -313,6 +335,8 @@ export async function sendPhoto(
     deps,
     scope,
   );
+  assertMessageResult('sendPhoto', scope, result);
+  return result;
 }
 
 export async function getUpdates(

@@ -6,6 +6,13 @@ export interface WriterDeps {
   now: () => Date;
   /** One LLM call per article (injectable seam — mocked in tests). */
   generate: (article: LlmArticle) => Promise<string>;
+  /**
+   * Max `selected` rows to process this run (default: all — the standalone
+   * `npm run write` behavior). The cron deliver step passes its selection
+   * count so one run never spends more than ~4 LLM calls even when stale
+   * `selected` leftovers from a failed run are still waiting.
+   */
+  limit?: number;
 }
 
 export interface ArticleResult {
@@ -29,8 +36,11 @@ export interface WriteSummary {
  * article) with ON DELETE RESTRICT — so regenerate is an UPDATE of the
  * existing row's caption, never a delete + reinsert (which would lose delivery
  * state and could orphan FK references). Status/created_at/posted_at/views are
- * preserved on conflict. Returns the draft id. Throws a typed
- * `draft save failed: <cause>` error (e.g. unknown article FK violation).
+ * preserved on conflict, as are the send-once tracking columns
+ * (`last_sent_at`, `telegram_message_id` — delivery history owned by the send
+ * step in `src/telegram/send.ts`, never rewritten by a regenerate). Returns
+ * the draft id. Throws a typed `draft save failed: <cause>` error (e.g.
+ * unknown article FK violation).
  */
 export function saveDraft(db: Database.Database, articleId: number, caption: string): number {
   try {
@@ -60,11 +70,21 @@ export function saveDraft(db: Database.Database, articleId: number, caption: str
 export async function runWriter(db: Database.Database, deps: WriterDeps): Promise<WriteSummary> {
   let articles: LlmArticle[];
   try {
-    articles = db
-      .prepare(
-        `SELECT id, title, source, url FROM articles WHERE status = 'selected' ORDER BY id`,
-      )
-      .all() as LlmArticle[];
+    // Bound per-run write set: the cron deliver step caps LLM calls at its
+    // selection count even when stale `selected` leftovers are waiting.
+    // Bound parameter (never interpolation) for the LIMIT value.
+    if (deps.limit !== undefined) {
+      const n = Math.max(0, Math.floor(deps.limit));
+      articles = db
+        .prepare(`SELECT id, title, source, url FROM articles WHERE status = 'selected' ORDER BY id LIMIT ?`)
+        .all(n) as LlmArticle[];
+    } else {
+      articles = db
+        .prepare(
+          `SELECT id, title, source, url FROM articles WHERE status = 'selected' ORDER BY id`,
+        )
+        .all() as LlmArticle[];
+    }
   } catch (err) {
     throw new Error(`writer run failed: ${err instanceof Error ? err.message : String(err)}`);
   }

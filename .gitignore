@@ -5,6 +5,9 @@ data/
 node_modules/
 dist/
 
+# Cron log output (docs/schedule.md)
+logs/
+
 # Secrets — see .env.example
 .env
 .env.*

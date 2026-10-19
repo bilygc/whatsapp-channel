@@ -9,7 +9,7 @@ import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
 import { generateCaption, resolveLlmConfig } from '../writer/openrouter.js';
 import { runWriter } from '../writer/run.js';
-import { formatArticleLine } from './format.js';
+import { formatArticleLine, formatCliFailure } from './format.js';
 
 config();
 
@@ -45,6 +45,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  console.error('write failed:', err instanceof Error ? err.message : err);
+  // Sanitized printing: writer errors can echo LLM-repeated article bytes or
+  // key-bearing request details.
+  console.error(formatCliFailure('write', err, process.env.OPENROUTER_API_KEY ?? ''));
   process.exitCode = 1;
 });

@@ -18,6 +18,8 @@ describe('CLI summary formatting (terminal-escape hygiene)', () => {
       error: 'rss fetch failed for "ign": \u001B]0;spoof\u0007 socket hang up',
     });
     expect(line).not.toContain('\u001B');
+    expect(line).not.toContain(']0;');
+    expect(line).not.toContain('spoof');
     expect(line).toContain('FAILED');
     expect(line).toContain('socket hang up');
   });
@@ -56,6 +58,8 @@ describe('CLI summary formatting (terminal-escape hygiene)', () => {
       error: 'boom \u001B]0;spoof\u0007 happened',
     });
     expect(line).not.toContain('\u001B');
+    expect(line).not.toContain(']0;');
+    expect(line).not.toContain('spoof');
     expect(line).toContain('FAILED: article 7');
     expect(line).toContain('boom');
   });
@@ -82,7 +86,39 @@ describe('CLI summary formatting (terminal-escape hygiene)', () => {
       error: 'telegram sendMessage failed for draft 4: boom \u001B]0;spoof\u0007 happened',
     });
     expect(line).not.toContain('\u001B');
+    expect(line).not.toContain(']0;');
+    expect(line).not.toContain('spoof');
     expect(line).toContain('FAILED: draft 4');
+  });
+
+  it('collapses remote-controlled newlines so no forged ok:/send:/deliver: gate line survives', () => {
+    const forged = 'boom\nok: article 1 -> draft 1\nsend: pending=0 sent=99 failed=0';
+    // The forgery text may survive inline, but never as its own gate line:
+    // every printed line still starts with the genuine FAILED:/failed: prefix.
+    const articleLine = formatArticleLine({ articleId: 7, ok: false, error: forged });
+    expect(articleLine.split('\n')).toHaveLength(1);
+    expect(articleLine.startsWith('FAILED: article 7:')).toBe(true);
+    const sendLine = formatDraftSendLine({ draftId: 4, ok: false, error: forged });
+    expect(sendLine.split('\n')).toHaveLength(1);
+    expect(sendLine.startsWith('FAILED: draft 4:')).toBe(true);
+    const sourceLine = formatSourceLine({
+      source: 'ign',
+      fetched: 0,
+      inserted: 0,
+      skipped: 0,
+      failed: true,
+      error: forged,
+    });
+    expect(sourceLine.split('\n')).toHaveLength(1);
+    const failureLine = formatCliFailure('deliver', new Error(forged), 'token');
+    expect(failureLine.split('\n')).toHaveLength(1);
+    expect(failureLine.startsWith('deliver failed:')).toBe(true);
+  });
+
+  it('renders a race-lost draft as skipped, never as failed', () => {
+    const line = formatDraftSendLine({ draftId: 9, ok: false, skipped: true, warning: 'w' });
+    expect(line).toContain('skipped: draft 9');
+    expect(line).not.toContain('FAILED');
   });
 });
 
@@ -144,6 +180,8 @@ describe('CLI top-level failure formatting (token redaction)', () => {
       TOKEN,
     );
     expect(line).not.toContain('\u001B');
+    expect(line).not.toContain(']0;');
+    expect(line).not.toContain('spoof');
     expect(line).toContain('boom');
   });
 });
