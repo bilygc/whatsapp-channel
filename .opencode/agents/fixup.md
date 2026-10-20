@@ -2,43 +2,38 @@
 description: Git fixup command generator for clean history via autosquash
 mode: subagent
 model: opencode-go/deepseek-v4.1-flash
-temperature: 0.0
-tools:
-  # Context gathering (Read-only)
-  read: true
-  list: true
-  glob: true
-  grep: true
-  line_view: true
-  # Git operations (Read-only git access)
-  bash: true
-  # Disable all modification and delegation tools
-  task: false
-  write: false
-  edit: false
-  webfetch: false
-  gitingest_tool: false
-  find_symbol: false
-  get_symbols_overview: false
-  find_referencing_symbols: false
-  ast_grep_tool: false
-  analyze_diagnostics: false
-  check_diagnostics: false
-  rename_symbol: false
-  restart_language_server: false
-  lsp_client: false
-  initialize_lsp: false
-  mutation_test: false
-  test_drop_analysis: false
-permission:
-  edit: deny
-  bash:
-    "git log*": allow
-    "git diff*": allow
-    "git status*": allow
-    "git show*": allow
-    "*": deny
-  webfetch: deny
+# V2 permissions (last matching rule wins).
+permissions:
+  - action: edit          # blocks edit / write / patch
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny          # read-only git inspection only
+  - action: shell
+    resource: "git log *"
+    effect: allow
+  - action: shell
+    resource: "git diff *"
+    effect: allow
+  - action: shell
+    resource: "git status *"
+    effect: allow
+  - action: shell
+    resource: "git show *"
+    effect: allow
+  - action: webfetch
+    resource: "*"
+    effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "*"
+    effect: deny
+  - action: execute
+    resource: "*"
+    effect: deny
 ---
 
 # Fixup: Git Fixup Command Generator

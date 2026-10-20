@@ -2,45 +2,39 @@
 description: Redundant and low-value test identifier for test suite pruning
 mode: subagent
 model: opencode-go/qwen3.8-flash
-temperature: 0.1
 steps: 25
-tools:
-  # Context gathering (Read-only)
-  read: true
-  list: true
-  glob: true
-  grep: true
-  line_view: true
-  # Code navigation (Read-only)
-  find_symbol: true
-  get_symbols_overview: true
-  # Specialized test analysis
-  bash: true
-  test_drop_analysis: true
-  # Disable modification and delegation tools
-  task: false
-  write: false
-  edit: false
-  webfetch: false
-  gitingest_tool: false
-  find_referencing_symbols: false
-  ast_grep_tool: false
-  analyze_diagnostics: false
-  check_diagnostics: false
-  rename_symbol: false
-  restart_language_server: false
-  lsp_client: false
-  initialize_lsp: false
-  mutation_test: false
-permission:
-  edit: deny
-  bash:
-    "npx jest*": allow
-    "npx vitest*": allow
-    "python -m pytest*": allow
-    "cargo test*": allow
-    "*": deny
-  webfetch: deny
+# V2 permissions (last matching rule wins).
+permissions:
+  - action: edit          # blocks edit / write / patch
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny          # only test-suite inspection commands below are reachable
+  - action: shell
+    resource: "npx jest *"
+    effect: allow
+  - action: shell
+    resource: "npx vitest *"
+    effect: allow
+  - action: shell
+    resource: "python -m pytest *"
+    effect: allow
+  - action: shell
+    resource: "cargo test *"
+    effect: allow
+  - action: webfetch
+    resource: "*"
+    effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "*"
+    effect: deny
+  - action: execute
+    resource: "*"
+    effect: deny
 ---
 
 # Test Drop: Redundant Test Identification Specialist

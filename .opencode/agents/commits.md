@@ -2,45 +2,36 @@
 description: Git commit message generator following conventional commit standards, and PR creation via GitHub MCP
 mode: subagent
 model: opencode-go/mimo-v2.5
-temperature: 0.2
-steps: 15
-tools:
-  # Context gathering (Read-only)
-  read: true
-  list: true
-  glob: true
-  grep: true
-  line_view: true
-  # Code navigation (Read-only)
-  find_symbol: true
-  get_symbols_overview: true
-  # Git operations — ONLY via the fixed helper script, see permission block
-  bash: true
-  # Disable modification and delegation tools
-  task: false
-  write: false
-  edit: false
-  webfetch: false
-  gitingest_tool: false
-  find_referencing_symbols: false
-  ast_grep_tool: false
-  analyze_diagnostics: false
-  check_diagnostics: false
-  rename_symbol: false
-  restart_language_server: false
-  lsp_client: false
-  initialize_lsp: false
-  mutation_test: false
-  test_drop_analysis: false
-permission:
-  edit: deny
-  bash:
-    "bash scripts/commits-helper.sh*": allow
-    "./scripts/commits-helper.sh*": allow
-  webfetch: deny
-  context7: deny
-  linear: deny
-  expo: deny
+steps: 20
+# V2 permissions (last matching rule wins).
+permissions:
+  - action: edit          # blocks edit / write / patch
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny          # local git goes ONLY through the helper script (see body)
+  - action: shell
+    resource: "bash scripts/commits-helper.sh *"
+    effect: allow
+  - action: shell
+    resource: "./scripts/commits-helper.sh *"
+    effect: allow
+  - action: webfetch
+    resource: "*"
+    effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
+  - action: linear_*      # Linear MCP — orchestrator only
+    resource: "*"
+    effect: deny
+  - action: context7_*    # Context7 MCP — librarian only
+    resource: "*"
+    effect: deny
+  - action: github_*      # GitHub MCP — commits owns branch push + PR creation
+    resource: "*"
+    effect: allow
 ---
 
 # Commits: Git Operations & PR Creation Specialist
@@ -73,12 +64,12 @@ improvising a raw git command — that is a sign the script needs to be
 extended, not a sign you should bypass it.
 
 This is not a preference — it is the actual security boundary for this
-agent. `permission.bash` pattern-matching in this OpenCode version does not
-reliably restrict ad-hoc commands once any allow-only ruleset is in place
-(a catch-all "*": deny causes the bash tool to be dropped from the schema
-entirely; without it, allow-only patterns provide no real command-level
-enforcement). The fixed script — not the permission block — is what makes
-this agent's git access meaningfully narrow.
+agent. This agent's V2 `permissions` allow exactly two shell patterns
+(`bash|./scripts/commits-helper.sh ...`) and deny all other shell commands,
+so ad-hoc `git` invocations are blocked at the permission layer, not by
+your judgment. The fixed script — not just the rule list — is what keeps
+this agent's git access meaningfully narrow (staging discipline, no
+force-push, conflict escalation are enforced in the script itself).
 
 ## Force-push is never permitted
 
@@ -99,7 +90,7 @@ This fetches `origin/main` and merges it into your current branch. Do this
 even if you don't think main has moved — the cost of checking is low, and
 the failure mode when you skip it is silent and hard to diagnose.
 
-### Why this matters (root cause, ATO-9 / PR #8)
+### Why this matters
 
 A branch that falls behind `main` can develop a merge conflict against the
 PR's base branch. When that happens, **GitHub does not run
@@ -132,7 +123,7 @@ ends up in a commit.
 
 ## Branch naming
 
-`type/ticket-id-short-slug` (e.g. `feat/ato-6-radius-validation`).
+`type/ticket-id-short-slug` (e.g. `feat/12-fetch-dedupe`, for GitHub issue #12).
 
 ## Conventional Commit Format
 

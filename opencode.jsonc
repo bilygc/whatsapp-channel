@@ -13,7 +13,7 @@
     "github": {
       "type": "remote",
       "url": "https://api.githubcopilot.com/mcp/",
-      "enabled":true,
+      "enabled": true,
       "oauth": false,
       "headers": {
         "Authorization": "Bearer {env:GITHUB_PAT}"
@@ -25,34 +25,37 @@
       "enabled": true
     },
   },
-  "permission": {
-    "context7*": "deny",
-    "github*": "deny",
-    "linear*": "deny",
-  },
-  "agent": {
+  // V2 permissions: ordered rules, last match wins. Global base: deny context7,
+  // GitHub, and Linear MCP for every agent; agent-specific allows below (and in
+  // .opencode/agents/*.md, appended after globals) grant exceptions.
+  "permissions": [
+    { "action": "context7_*", "resource": "*", "effect": "deny" },
+    { "action": "github_*", "resource": "*", "effect": "deny" },
+    { "action": "linear_*", "resource": "*", "effect": "deny" },
+  ],
+  "agents": {
     "librarian": {
-      "permission": {
-        "context7*": "allow"
-      }
+      "permissions": [
+        { "action": "context7_*", "resource": "*", "effect": "allow" },
+      ],
     },
     "commits": {
-      "permission": {
-        "github*": "allow"
-      }
+      "permissions": [
+        { "action": "github_*", "resource": "*", "effect": "allow" },
+      ],
     },
     "orchestrator": {
-      "permission": {
-        "linear*": "allow"
-      }
+      "permissions": [
+        { "action": "linear_*", "resource": "*", "effect": "allow" },
+      ],
     },
     "build-verify": {
-      "permission": {
-        "context7*": "deny",
-        "github*": "deny",
-        "linear*": "deny",
-      }
-    }
+      "permissions": [
+        { "action": "context7_*", "resource": "*", "effect": "deny" },
+        { "action": "github_*", "resource": "*", "effect": "deny" },
+        { "action": "linear_*", "resource": "*", "effect": "deny" },
+      ],
+    },
   },
   "watcher": {
     "ignore": ["node_modules/**", "dist/**", ".git/**"]

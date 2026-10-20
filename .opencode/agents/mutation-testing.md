@@ -2,44 +2,36 @@
 description: Test quality validation via mutation testing analysis
 mode: subagent
 model: opencode-go/hy3
-temperature: 0.1
 steps: 40
-tools:
-  # Context gathering (Read-only)
-  read: true
-  list: true
-  glob: true
-  grep: true
-  line_view: true
-  # Code navigation (Read-only)
-  find_symbol: true
-  get_symbols_overview: true
-  # Mutation testing execution
-  bash: true
-  mutation_test: true
-  # Disable modification and delegation tools
-  task: false
-  write: false
-  edit: false
-  webfetch: false
-  gitingest_tool: false
-  find_referencing_symbols: false
-  ast_grep_tool: false
-  analyze_diagnostics: false
-  check_diagnostics: false
-  rename_symbol: false
-  restart_language_server: false
-  lsp_client: false
-  initialize_lsp: false
-  test_drop_analysis: false
-permission:
-  edit: deny
-  bash:
-    "npx stryker*": allow
-    "npx mutmut*": allow
-    "cargo mutants*": allow
-    "*": deny
-  webfetch: deny
+# V2 permissions (last matching rule wins).
+permissions:
+  - action: edit          # blocks edit / write / patch
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny          # only the mutation-testing commands below are reachable
+  - action: shell
+    resource: "npx stryker *"
+    effect: allow
+  - action: shell
+    resource: "npx mutmut *"
+    effect: allow
+  - action: shell
+    resource: "cargo mutants *"
+    effect: allow
+  - action: webfetch
+    resource: "*"
+    effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "*"
+    effect: deny
+  - action: execute
+    resource: "*"
+    effect: deny
 ---
 
 # Mutation Testing: Test Quality Validation Specialist
