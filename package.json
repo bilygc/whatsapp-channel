@@ -1,0 +1,39 @@
+{
+  "name": "whatsapp-channel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Spanish-language WhatsApp channel pipeline: English game news in, Spanish captions out.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "fetch": "tsx src/cli/fetch.ts",
+    "select": "tsx src/cli/select.ts",
+    "write": "tsx src/cli/write.ts",
+    "deliver": "tsx src/cli/deliver.ts",
+    "scheduleInstall": "tsx src/cli/schedule.ts install",
+    "scheduleList": "tsx src/cli/schedule.ts list",
+    "scheduleUninstall": "tsx src/cli/schedule.ts uninstall",
+    "previewDrafts": "tsx src/cli/preview-drafts.ts",
+    "telegramSetup": "tsx src/cli/telegram-setup.ts",
+    "telegramSend": "tsx src/cli/telegram-send.ts",
+    "telegramListen": "tsx src/cli/telegram-listen.ts",
+    "migrate": "tsx src/cli/migrate.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "audit": "npm audit --audit-level=high",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.4.5",
+    "rss-parser": "^3.13.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.7.4",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.3"
+  }
+}
