@@ -1,7 +1,7 @@
 /** Maximum caption length (see prompts.ts SYSTEM_PROMPT — kept in sync). */
 
 /** WhatsApp-caption ceiling: keep drafts paste-ready without manual trimming. */
-export const MAX_CAPTION_CHARS = 1000;
+export const MAX_CAPTION_CHARS = 1500;
 
 export interface ValidateInput {
   caption: string;
