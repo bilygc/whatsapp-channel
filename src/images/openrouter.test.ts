@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_IMAGE_MODEL,
   generateImage,
+  IMAGE_ERROR_MESSAGE_CAP,
+  IMAGE_ERROR_RAW_SNIPPET_CAP,
   IMAGE_MAX_BODY_BYTES,
   IMAGE_TIMEOUT_MS,
   isPolicyRefusal,
@@ -43,6 +45,24 @@ function errorResponse(status: number, body: unknown, headers: Record<string, st
     arrayBuffer: async () =>
       new TextEncoder().encode(JSON.stringify(body)).buffer as ArrayBuffer,
     json: async () => body,
+    body: { cancel: async () => {} },
+  } as unknown as Response;
+}
+
+/**
+ * Raw-text error body (HTML/WAF pages, proxy errors): `json()` throws, so a
+ * test using this helper proves the error path reads the body as text first
+ * and never depends on `res.json()`.
+ */
+function rawErrorResponse(status: number, rawText: string, headers: Record<string, string> = {}) {
+  return {
+    ok: false,
+    status,
+    headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+    arrayBuffer: async () => new TextEncoder().encode(rawText).buffer as ArrayBuffer,
+    json: async () => {
+      throw new SyntaxError('Unexpected token in JSON');
+    },
     body: { cancel: async () => {} },
   } as unknown as Response;
 }
@@ -352,5 +372,189 @@ describe('generateImage', () => {
     );
     expect(err).toMatch(/^images generate failed for draft 1: /);
     expect(err).not.toContain(key);
+  });
+
+  it('surfaces the API message and type verbatim, message first (phone truncates at ~180)', async () => {
+    const fetchFn = vi.fn(async () =>
+      errorResponse(400, {
+        error: {
+          message: 'prompt too long, please shorten it',
+          code: 'E123',
+          metadata: { error_type: 'invalid_request' },
+        },
+      }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 9', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ImageApiError);
+    expect((err as Error).message).toBe(
+      'images generate failed for draft 9: HTTP 400: "prompt too long, please shorten it" [type=invalid_request code=E123]',
+    );
+    // Message lands before the tokens: the meaningful part survives a phone-side cut.
+    const msg = (err as Error).message;
+    expect(msg.indexOf('"prompt too long')).toBeLessThan(msg.indexOf('[type='));
+    expect(isReferenceUnfetchable(err)).toBe(false);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('truncates overlong API messages at 300 chars', async () => {
+    expect(IMAGE_ERROR_MESSAGE_CAP).toBe(300);
+    const long = `prefix ${'x'.repeat(500)}`;
+    const fetchFn = vi.fn(async () =>
+      errorResponse(400, { error: { message: long } }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 9', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    ).catch((e: Error) => e.message);
+    // Collapsed message is capped at exactly 300 chars inside the quotes.
+    expect(err).toContain(`"${`prefix ${'x'.repeat(293)}`}"`);
+    expect(err).not.toContain('x'.repeat(301));
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('stringifies numeric error codes', async () => {
+    const fetchFn = vi.fn(async () =>
+      errorResponse(400, {
+        error: { message: 'nope', code: 429, metadata: { error_type: 'rate_limited' } },
+      }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 9', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    ).catch((e: Error) => e.message);
+    expect(err).toContain('HTTP 400: "nope" [type=rate_limited code=429]');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('dedupes a code that repeats the type token', async () => {
+    const fetchFn = vi.fn(async () =>
+      errorResponse(400, { error: { message: 'bad request body', code: 'bad_request' } }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 9', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    ).catch((e: Error) => e.message);
+    // The type here is derived from the code itself — shown once, not twice.
+    expect(err).toContain('HTTP 400: "bad request body" [type=bad_request]');
+    expect(err).not.toContain('code=');
+  });
+
+  it('surfaces HTML/WAF bodies as a capped snippet instead of throwing', async () => {
+    expect(IMAGE_ERROR_RAW_SNIPPET_CAP).toBe(200);
+    const html = `<html>\n  <head><title>Access\n  Denied</title></head>\n  <body>${'x'.repeat(300)}</body>\n</html>`;
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () => rawErrorResponse(500, html));
+    const err = await generateImage(
+      { scope: 'draft 9', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep }),
+    ).catch((e: Error) => e.message);
+    // Classification unchanged: a 500 is still transient and retried to exhaustion.
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    // Whitespace collapsed, capped at 200 chars, tagged — never a raw throw.
+    const collapsed = html.replace(/\s+/g, ' ').trim().slice(0, IMAGE_ERROR_RAW_SNIPPET_CAP);
+    expect(err).toContain(`HTTP 500: "${collapsed}" [unparseable body]`);
+  });
+
+  it('surfaces oversize error bodies without buffering them', async () => {
+    const fetchFn = vi.fn(async () =>
+      errorResponse(
+        400,
+        { error: { message: 'too big to read' } },
+        { 'content-length': '999999' },
+      ),
+    );
+    const err = await generateImage(
+      { scope: 'draft 9', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {}, maxBytes: 16 }),
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ImageApiError);
+    expect((err as Error).message).toContain(
+      'HTTP 400 (response body too large (999999 bytes declared, limit 16))',
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the reference-unfetchable retry shape with the API message first', async () => {
+    const fetchFn = vi.fn(async () =>
+      errorResponse(400, {
+        error: {
+          message: 'upstream rejected the reference pixels',
+          metadata: { error_type: 'image_download_failed' },
+        },
+      }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 3', prompt: 'x', referenceUrl: 'https://img.example/gone.jpg' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    ).catch((e) => e);
+    expect(isReferenceUnfetchable(err)).toBe(true);
+    // With-reference attempt + exactly one text-only retry, then permanent.
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect((err as Error).message).toBe(
+      'images generate failed for draft 3: HTTP 400: "upstream rejected the reference pixels" [type=image_download_failed] (reference image unfetchable upstream)',
+    );
+  });
+
+  it('keeps policy 403 no-retry with the API message first', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () =>
+      errorResponse(403, {
+        error: {
+          message: 'violates policy: trademarked hero front and center',
+          metadata: { error_type: 'content_policy_violation' },
+        },
+      }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 2', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep }),
+    ).catch((e) => e);
+    expect(isPolicyRefusal(err)).toBe(true);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect((err as Error).message).toBe(
+      'images generate failed for draft 2: HTTP 403: "violates policy: trademarked hero front and center" [type=content_policy_violation] (content policy refusal — not retrying)',
+    );
+  });
+
+  it('keeps 429 backoff with the API message and retry-after suffix', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () =>
+      errorResponse(
+        429,
+        { error: { message: 'slow down, generation queue full', code: 'rate_limited' } },
+        { 'retry-after': '7' },
+      ),
+    );
+    const err = await generateImage(
+      { scope: 'draft 1', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep }),
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ImageApiError);
+    expect((err as ImageApiError).kind).toBe('retryable');
+    expect((err as ImageApiError).retryAfterSec).toBe(7);
+    // Still the 3-call backoff shape.
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect((err as Error).message).toBe(
+      'images generate failed for draft 1: HTTP 429: "slow down, generation queue full" [type=rate_limited] (retry after 7s)',
+    );
+  });
+
+  it('redacts the API key even when echoed inside the API error message', async () => {
+    const key = 'super-secret-image-key';
+    const fetchFn = vi.fn(async () =>
+      errorResponse(401, { error: { message: `invalid key ${key} provided`, code: 'bad_key' } }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 1', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, apiKey: key, sleep: async () => {} }),
+    ).catch((e: Error) => e.message);
+    expect(err).toMatch(/^images generate failed for draft 1: HTTP 401: "/);
+    expect(err).not.toContain(key);
+    expect(err).toContain('[redacted]');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });
