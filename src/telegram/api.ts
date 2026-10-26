@@ -83,6 +83,10 @@ export interface TelegramChat {
 export interface TelegramMessage {
   message_id: number;
   chat: TelegramChat;
+  /** Present on message updates (absent on callback-query wrappers). Untrusted. */
+  text?: unknown;
+  /** Present when the message is a reply. Untrusted — validate before use. */
+  reply_to_message?: { message_id?: unknown };
 }
 
 export interface TelegramCallbackQuery {
@@ -398,4 +402,161 @@ export async function editMessageReplyMarkup(
     deps,
     'callback',
   );
+}
+
+/**
+ * Edit the text of a bot message (used for the `/img` status line:
+ * "🎨 Generando imagen…" → "✅ Imagen lista" / failure reason).
+ * Plaintext, no parse_mode (same convention as sendMessage).
+ */
+export async function editMessageText(
+  args: {
+    chatId: string;
+    messageId: number;
+    text: string;
+    replyMarkup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+  },
+  deps: TelegramDeps,
+  scope = 'callback',
+): Promise<void> {
+  await callTelegramMethod<true>(
+    'editMessageText',
+    {
+      chat_id: args.chatId,
+      message_id: args.messageId,
+      text: args.text,
+      ...(args.replyMarkup ? { reply_markup: args.replyMarkup } : {}),
+    },
+    deps,
+    scope,
+  );
+}
+
+export interface EditMediaPhoto {
+  chatId: string;
+  messageId: number;
+  caption: string;
+  replyMarkup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+  /** Raw image bytes (OpenRouter returns base64 — decoded before this call). */
+  imageBytes: Buffer;
+  filename?: string;
+  contentType?: string;
+}
+
+/**
+ * Swap a draft message's photo while keeping caption + buttons: thin
+ * multipart/form-data wrapper around `editMessageMedia` with an
+ * `InputMediaPhoto` (`media: 'attach://image'`) plus the same inline
+ * keyboard (`reply_markup` param) and a form file field `image` carrying
+ * the bytes. Everything else (sendPhoto, sendMessage) stays JSON — only
+ * this call needs multipart, because the bytes live on disk, not at a URL.
+ *
+ * Conventions mirror `callTelegramMethod`: `redirect: 'error'` (the token
+ * rides in the URL), an `AbortSignal.timeout` budget, a response body cap
+ * enforced WHILE streaming, and typed
+ * `telegram editMessageMedia failed for <scope>: <cause>` errors with the
+ * token redacted. The API returns the edited Message on success — the
+ * shape is validated (an object with an integer `message_id`, or `true`).
+ */
+export async function editMessageMediaPhoto(
+  photo: EditMediaPhoto,
+  deps: TelegramDeps,
+  scope = 'draft',
+): Promise<void> {
+  const maxBytes = deps.maxBytes ?? TELEGRAM_MAX_BODY_BYTES;
+  const timeoutMs = deps.timeoutMs ?? TELEGRAM_TIMEOUT_MS;
+  const fail = (cause: string): TelegramApiError =>
+    new TelegramApiError(
+      `telegram editMessageMedia failed for ${scope}: ${sanitizeTelegram(cause, deps.token)}`,
+    );
+
+  const media = JSON.stringify({
+    type: 'photo',
+    media: 'attach://image',
+    caption: photo.caption,
+  });
+  const form = new FormData();
+  form.append('chat_id', photo.chatId);
+  form.append('message_id', String(photo.messageId));
+  form.append('media', media);
+  if (photo.replyMarkup) {
+    form.append('reply_markup', JSON.stringify(photo.replyMarkup));
+  }
+  const filename = photo.filename ?? 'image.png';
+  const contentType = photo.contentType ?? 'image/png';
+  form.append(
+    'image',
+    // Copy into a fresh Uint8Array so the part satisfies BlobPart under
+    // strict TS (a Node Buffer's SharedArrayBuffer typing does not).
+    new Blob([new Uint8Array(photo.imageBytes)], { type: contentType }),
+    filename,
+  );
+
+  const url = `${TELEGRAM_API_BASE}/bot${deps.token}/editMessageMedia`;
+  let res: Response;
+  try {
+    // The token rides in the URL: fail closed on redirects rather than leak
+    // it to a redirect target (same convention as callTelegramMethod).
+    res = await deps.fetchFn(url, {
+      method: 'POST',
+      redirect: 'error',
+      body: form,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    throw fail(`request failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (!res.ok) {
+    let retryAfterSec: number | undefined;
+    try {
+      retryAfterSec = retryAfterFromBody(await readJsonCapped(res, maxBytes));
+    } catch {
+      retryAfterSec = undefined;
+    }
+    try {
+      await res.body?.cancel();
+    } catch {
+      // A broken body must not mask the HTTP error — ignore cancel failures.
+    }
+    const retryNote = retryAfterSec !== undefined ? ` (retry after ${retryAfterSec}s)` : '';
+    throw new TelegramApiError(
+      `telegram editMessageMedia failed for ${sanitizeTelegram(scope, deps.token)}: HTTP ${res.status}${retryNote}`,
+      { status: res.status, retryAfterSec },
+    );
+  }
+
+  let body: { ok?: unknown; result?: unknown; description?: unknown; parameters?: unknown };
+  try {
+    body = (await readJsonCapped(res, maxBytes)) as {
+      ok?: unknown;
+      result?: unknown;
+      description?: unknown;
+      parameters?: unknown;
+    };
+  } catch (err) {
+    throw fail(err instanceof Error ? err.message : String(err));
+  }
+  if (body.ok !== true) {
+    const description =
+      typeof body.description === 'string' ? body.description : 'unknown API error';
+    throw new TelegramApiError(
+      `telegram editMessageMedia failed for ${sanitizeTelegram(scope, deps.token)}: ${description}`,
+      { retryAfterSec: retryAfterFromBody(body) },
+    );
+  }
+  // editMessageMedia returns the edited Message (or True): accept either,
+  // reject anything else typed (same shape discipline as assertMessageResult).
+  if (body.result === true) return;
+  const messageId = (body.result as { message_id?: unknown } | null)?.message_id;
+  if (
+    typeof body.result !== 'object' ||
+    body.result === null ||
+    !Number.isSafeInteger(messageId)
+  ) {
+    throw new TelegramApiError(
+      `telegram editMessageMedia failed for ${sanitizeTelegram(scope, deps.token)}: unexpected response shape ` +
+        `(expected an edited message with an integer message_id)`,
+    );
+  }
 }
