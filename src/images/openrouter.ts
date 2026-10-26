@@ -25,6 +25,9 @@
  * - 403 with `error.metadata.error_type` of `content_policy_violation` /
  *   `refusal` → PERMANENT, never retry (often caused by named trademarked
  *   characters — the orchestration layer falls back to a no-names prompt).
+ *   The same provider filter also surfaces as other statuses (notably 400)
+ *   with explicit content-filter phrasing or a `content_filter` error type —
+ *   those classify as policy too.
  * - 400 with error types `image_download_failed` / `image_not_found` →
  *   the reference URL couldn't be fetched upstream: retry ONCE without the
  *   reference (text-only prompt).
@@ -409,6 +412,27 @@ function isPolicyErrorType(t: string | undefined): boolean {
   return t.includes('content_policy_violation') || t === 'refusal' || t.includes('refusal');
 }
 
+/**
+ * Tight content-filter phrasing match (case-insensitive) against the
+ * human-readable API message. Matches ONLY explicit filter wording — never a
+ * bare "policy" mention, so a plain validation 400 that happens to say
+ * "policy" stays generic.
+ */
+function isContentFilterMessage(message: string | undefined): boolean {
+  if (!message) return false;
+  return (
+    /filtered (?:due|because)/i.test(message) ||
+    /content management policy/i.test(message) ||
+    /content (management )?policy/i.test(message)
+  );
+}
+
+/** True for machine-readable content-filter tokens (e.g. `content_filter`). */
+function isContentFilterErrorType(t: string | undefined): boolean {
+  if (!t) return false;
+  return /content.filter/i.test(t);
+}
+
 function isReferenceErrorType(t: string | undefined): boolean {
   if (!t) return false;
   return t.includes('image_download_failed') || t.includes('image_not_found');
@@ -459,9 +483,11 @@ function requestBody(model: string, prompt: string, referenceUrl?: string): stri
  * Retry policy: transient failures (HTTP 429 / 5xx, dropped connections)
  * retry up to 2 times; a 400 with an `image_download_failed` /
  * `image_not_found` type retries ONCE text-only (the reference URL couldn't
- * be fetched upstream); a 403 content-policy refusal fails immediately with
- * `kind: 'policy'` (the orchestration layer falls back to a no-names prompt
- * once — never spend paid generations re-sending a refused prompt).
+ * be fetched upstream); a content-policy refusal (403 policy/refusal type,
+ * or explicit content-filter phrasing / a `content_filter` type at any
+ * status) fails immediately with `kind: 'policy'` (the orchestration layer
+ * walks progressively reduced prompts — never spend paid generations
+ * re-sending a refused prompt).
  * Throws a typed `images generate failed for <scope>: <cause>` error —
  * the key is never in the message.
  */
@@ -563,9 +589,19 @@ export async function generateImage(
       }
 
       // Permanent: content-policy refusal — never retry the same prompt.
-      if (res.status === 403 && isPolicyErrorType(errorType)) {
-        throw fail(formatErrorCause(403, detail, '(content policy refusal — not retrying)'), {
-          status: 403,
+      // Fires on (a) a 403 with a policy/refusal error type, or (b) ANY status
+      // whose API message uses explicit content-filter phrasing (providers
+      // surface the same filter as 400 or 403), or whose error type is a
+      // content-filter token. Rejected filter calls are unbilled and fast —
+      // the orchestration layer walks progressively reduced prompts
+      // (see src/images/run.ts).
+      const isPolicy =
+        (res.status === 403 && isPolicyErrorType(errorType)) ||
+        isContentFilterMessage(errorMessage) ||
+        isContentFilterErrorType(errorType);
+      if (isPolicy) {
+        throw fail(formatErrorCause(res.status, detail, '(content policy refusal — not retrying)'), {
+          status: res.status,
           kind: 'policy',
         });
       }
