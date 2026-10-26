@@ -558,3 +558,76 @@ describe('generateImage', () => {
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('generateImage content-filter policy classification', () => {
+  it('classifies a 400 with the provider filter message as policy (live 400 shape)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () =>
+      errorResponse(400, {
+        error: {
+          message:
+            'The response was filtered due to the prompt triggering our content management policy.',
+          code: 400,
+        },
+      }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 48', prompt: 'x', referenceUrl: 'https://img.example/x.jpg' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep }),
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ImageApiError);
+    expect(isPolicyRefusal(err)).toBe(true);
+    expect(isReferenceUnfetchable(err)).toBe(false);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect((err as Error).message).toBe(
+      'images generate failed for draft 48: HTTP 400: "The response was filtered due to the prompt triggering our content management policy." [type=400] (content policy refusal — not retrying)',
+    );
+  });
+
+  it('classifies a content_filter error type as policy at any status', async () => {
+    const fetchFn = vi.fn(async () =>
+      errorResponse(422, {
+        error: { message: 'blocked by filter', metadata: { error_type: 'content_filter' } },
+      }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 5', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ImageApiError);
+    expect(isPolicyRefusal(err)).toBe(true);
+    expect((err as ImageApiError).status).toBe(422);
+    expect((err as Error).message).toContain('(content policy refusal — not retrying)');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('classifies "filtered because" phrasing as policy', async () => {
+    const fetchFn = vi.fn(async () =>
+      errorResponse(400, { error: { message: 'Request was filtered because of policy' } }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 6', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    ).catch((e) => e);
+    expect(isPolicyRefusal(err)).toBe(true);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a generic 400 with incidental "policy" wording generic (no ladder trigger)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () =>
+      errorResponse(400, { error: { message: 'invalid policy field: must be a string' } }),
+    );
+    const err = await generateImage(
+      { scope: 'draft 7', prompt: 'x' },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep }),
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ImageApiError);
+    expect(isPolicyRefusal(err)).toBe(false);
+    expect(isReferenceUnfetchable(err)).toBe(false);
+    expect((err as ImageApiError).kind).toBe('failed');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+});
