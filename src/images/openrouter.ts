@@ -56,6 +56,19 @@ export const IMAGE_MAX_ATTEMPTS = IMAGE_RETRY_DELAYS_MS.length + 1;
 /** Upper bound for honouring an image-API `Retry-After` backoff hint. */
 export const IMAGE_MAX_RETRY_AFTER_SEC = 120;
 
+/**
+ * Cap for an API `error.message` surfaced in a failure cause. The message
+ * itself comes FIRST in the cause because a downstream phone display
+ * truncates at ~180 chars — the meaningful part must land in the first 180.
+ */
+export const IMAGE_ERROR_MESSAGE_CAP = 300;
+
+/**
+ * Cap for the raw-body snippet surfaced when an error body is not JSON
+ * (HTML/WAF pages): enough to identify the upstream, never a full dump.
+ */
+export const IMAGE_ERROR_RAW_SNIPPET_CAP = 200;
+
 export interface ImageDeps {
   fetchFn: typeof fetch;
   apiKey: string;
@@ -193,6 +206,61 @@ async function readJsonCapped(res: Response, maxBytes: number): Promise<unknown>
   return body;
 }
 
+/**
+ * Read a response body as text with a byte cap enforced WHILE streaming
+ * (memory-DoS guard), mirroring `readJsonCapped`. Used for non-2xx bodies:
+ * the text is JSON-parsed best-effort afterwards, so HTML/WAF/empty
+ * upstreams stay diagnosable instead of throwing away all detail with a
+ * blind JSON parse.
+ */
+async function readTextCapped(res: Response, maxBytes: number): Promise<string> {
+  const declared = declaredLength(res);
+  if (declared != null && declared > maxBytes) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // A broken body must not mask the oversize error — ignore cancel failures.
+    }
+    throw new Error(`response body too large (${declared} bytes declared, limit ${maxBytes})`);
+  }
+  const stream = res.body as ReadableStream<Uint8Array> | null;
+  if (stream != null && typeof stream.getReader === 'function') {
+    const reader = stream.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          total += value.byteLength;
+          if (total > maxBytes) {
+            await reader.cancel();
+            throw new Error(`response body too large (exceeds ${maxBytes} bytes)`);
+          }
+          chunks.push(value);
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  }
+  const raw = res as Response & { arrayBuffer?: () => Promise<ArrayBuffer> };
+  if (typeof raw.arrayBuffer === 'function') {
+    const buf = await raw.arrayBuffer.call(res);
+    if (buf.byteLength > maxBytes) {
+      throw new Error(`response body too large (${buf.byteLength} bytes, limit ${maxBytes})`);
+    }
+    return Buffer.from(buf).toString('utf8');
+  }
+  const text = await res.text();
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    throw new Error(`response body too large (limit ${maxBytes} bytes)`);
+  }
+  return text;
+}
+
 /** Transient HTTP statuses worth another attempt (429 + server blips). */
 function isRetryableStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
@@ -250,6 +318,90 @@ function errorTypeFromBody(body: unknown): string | undefined {
   if (typeof code === 'string' && code !== '') return code.toLowerCase();
   if (typeof code === 'number') return String(code);
   return undefined;
+}
+
+/** Collapse every whitespace run to a single space and trim the ends. */
+function collapseWhitespace(raw: string): string {
+  return raw.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Best-effort extraction of OpenRouter's human-readable API error message:
+ * `{error: {message}}`. Collapsed to one line and capped at
+ * IMAGE_ERROR_MESSAGE_CAP chars; non-string or blank values are ignored.
+ */
+function errorMessageFromBody(body: unknown): string | undefined {
+  if (typeof body !== 'object' || body === null) return undefined;
+  const err = (body as { error?: unknown }).error;
+  if (typeof err !== 'object' || err === null) return undefined;
+  const message = (err as Record<string, unknown>).message;
+  if (typeof message !== 'string') return undefined;
+  const collapsed = collapseWhitespace(message);
+  if (collapsed === '') return undefined;
+  return collapsed.length > IMAGE_ERROR_MESSAGE_CAP
+    ? collapsed.slice(0, IMAGE_ERROR_MESSAGE_CAP)
+    : collapsed;
+}
+
+/**
+ * Best-effort extraction of OpenRouter's machine-readable error code:
+ * `{error: {code}}` (numbers stringified). Blank values are ignored. Note
+ * `errorTypeFromBody()` may itself be derived from this field — the display
+ * in `formatErrorCause` dedupes a code that repeats the type token.
+ */
+function errorCodeFromBody(body: unknown): string | undefined {
+  if (typeof body !== 'object' || body === null) return undefined;
+  const err = (body as { error?: unknown }).error;
+  if (typeof err !== 'object' || err === null) return undefined;
+  const code = (err as Record<string, unknown>).code;
+  if (typeof code === 'string') return code === '' ? undefined : code;
+  if (typeof code === 'number') return Number.isFinite(code) ? String(code) : undefined;
+  return undefined;
+}
+
+/** Structured detail extracted from a non-2xx image-API response body. */
+export interface ErrorDetail {
+  /** Human-readable API message (whitespace-collapsed, capped). */
+  message?: string;
+  /** Machine-readable classification token (from `errorTypeFromBody`). */
+  type?: string;
+  /** Machine-readable error code (numbers stringified). */
+  code?: string;
+  /** Capped raw snippet, set only when the body was not blank JSON. */
+  rawSnippet?: string;
+  /** Oversize-guard text, set only when the body exceeded the byte cap. */
+  bodyTooLargeMessage?: string;
+}
+
+/**
+ * Build one non-2xx failure cause. The API message comes FIRST (a downstream
+ * phone display truncates at ~180 chars — the meaningful part must land in
+ * the first 180), machine-readable `[type=… code=…]` tokens next (missing
+ * parts omitted, a code repeating the type deduped), and the caller's
+ * human-readable suffix last. Unparseable bodies surface a capped raw
+ * snippet plus `[unparseable body]`; oversize bodies surface only the cap
+ * note (the bytes are never buffered). A blank body yields a bare
+ * `HTTP <status>` — there is no detail to surface.
+ */
+function formatErrorCause(status: number, detail: ErrorDetail, suffix?: string): string {
+  let cause = `HTTP ${status}`;
+  if (detail.bodyTooLargeMessage !== undefined) {
+    cause += ` (${detail.bodyTooLargeMessage})`;
+  } else if (detail.rawSnippet !== undefined) {
+    cause += `: "${detail.rawSnippet}" [unparseable body]`;
+  } else {
+    if (detail.message !== undefined) cause += `: "${detail.message}"`;
+    const tokens: string[] = [];
+    if (detail.type !== undefined) tokens.push(`type=${detail.type}`);
+    if (detail.code !== undefined) {
+      const repeatsType =
+        detail.type !== undefined && detail.code.toLowerCase() === detail.type.toLowerCase();
+      if (!repeatsType) tokens.push(`code=${detail.code}`);
+    }
+    if (tokens.length > 0) cause += ` [${tokens.join(' ')}]`;
+  }
+  if (suffix !== undefined) cause += ` ${suffix}`;
+  return cause;
 }
 
 function isPolicyErrorType(t: string | undefined): boolean {
@@ -368,16 +520,42 @@ export async function generateImage(
     }
 
     if (!res.ok) {
-      // Read the error body best-effort (capped) for the machine-readable
-      // type BEFORE deciding retry vs permanent; release the connection as well.
+      // Read the error body as capped TEXT first, then JSON-parse
+      // best-effort: HTML/WAF/non-JSON upstreams stay diagnosable instead of
+      // throwing away all detail with a blind JSON parse. Classification and
+      // retry behavior below are unchanged — only the cause gains detail.
+      let errorMessage: string | undefined;
       let errorType: string | undefined;
-      let retryAfterSec = retryAfterFromHeaders(res);
+      let errorCode: string | undefined;
+      let rawSnippet: string | undefined;
+      let bodyTooLargeMessage: string | undefined;
+      const retryAfterSec = retryAfterFromHeaders(res);
       try {
-        const errBody = await readJsonCapped(res, maxBytes);
-        errorType = errorTypeFromBody(errBody);
-      } catch {
-        errorType = undefined;
+        const rawText = await readTextCapped(res, maxBytes);
+        if (rawText.trim() !== '') {
+          try {
+            const errBody: unknown = JSON.parse(rawText);
+            errorMessage = errorMessageFromBody(errBody);
+            errorType = errorTypeFromBody(errBody);
+            errorCode = errorCodeFromBody(errBody);
+          } catch {
+            rawSnippet = collapseWhitespace(rawText).slice(0, IMAGE_ERROR_RAW_SNIPPET_CAP);
+          }
+        }
+      } catch (err) {
+        // Oversize (or otherwise unreadable) body: surface the guard note,
+        // never the raw bytes. Anything else leaves the detail blank.
+        if (err instanceof Error && /too large/.test(err.message)) {
+          bodyTooLargeMessage = err.message;
+        }
       }
+      const detail: ErrorDetail = {
+        message: errorMessage,
+        type: errorType,
+        code: errorCode,
+        rawSnippet,
+        bodyTooLargeMessage,
+      };
       try {
         await res.body?.cancel();
       } catch {
@@ -386,7 +564,7 @@ export async function generateImage(
 
       // Permanent: content-policy refusal — never retry the same prompt.
       if (res.status === 403 && isPolicyErrorType(errorType)) {
-        throw fail(`HTTP 403 (content policy refusal — not retrying)`, {
+        throw fail(formatErrorCause(403, detail, '(content policy refusal — not retrying)'), {
           status: 403,
           kind: 'policy',
         });
@@ -399,17 +577,20 @@ export async function generateImage(
           referenceDropped = true;
           continue;
         }
-        throw fail(`HTTP 400 (reference image unfetchable upstream)`, {
-          status: 400,
-          kind: 'reference-unfetchable',
-        });
+        throw fail(
+          formatErrorCause(400, detail, '(reference image unfetchable upstream)'),
+          {
+            status: 400,
+            kind: 'reference-unfetchable',
+          },
+        );
       }
       if (isRetryableStatus(res.status)) {
         if (res.status === 429 && retryAfterSec !== undefined) {
           const waitSec = Math.min(retryAfterSec, IMAGE_MAX_RETRY_AFTER_SEC);
           await sleep(waitSec * 1000);
           if (attempt < IMAGE_MAX_ATTEMPTS - 1) continue;
-          throw fail(`HTTP 429 (retry after ${retryAfterSec}s)`, {
+          throw fail(formatErrorCause(429, detail, `(retry after ${retryAfterSec}s)`), {
             status: 429,
             retryAfterSec,
             kind: 'retryable',
@@ -419,11 +600,14 @@ export async function generateImage(
           await sleep(IMAGE_RETRY_DELAYS_MS[attempt]);
           continue;
         }
-        throw fail(`HTTP ${res.status}`, { status: res.status, kind: 'retryable' });
+        throw fail(formatErrorCause(res.status, detail), {
+          status: res.status,
+          kind: 'retryable',
+        });
       }
       // Late reference-unfetchable without a machine-readable type on a
       // non-400 (defensive): surface the kind so callers can branch.
-      throw fail(`HTTP ${res.status}`, {
+      throw fail(formatErrorCause(res.status, detail), {
         status: res.status,
         kind: 'failed',
       });
