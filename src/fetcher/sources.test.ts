@@ -437,11 +437,19 @@ describe('migration runner', () => {
       const appliedFirst = applyMigrations(db);
       expect(appliedFirst).toContain('0001_init.sql');
       expect(appliedFirst).toContain('0002_draft_send_tracking.sql');
+      expect(appliedFirst).toContain('0003_draft_generated_image.sql');
       // user_version tracks the migration count (one file per version).
       expect(getUserVersion(db)).toBe(appliedFirst.length);
-      expect(getUserVersion(db)).toBe(2);
+      expect(getUserVersion(db)).toBe(3);
       expect(
         db.prepare(`SELECT name FROM sqlite_master WHERE name = 'articles'`).get(),
+      ).toBeTruthy();
+      expect(
+        db
+          .prepare(
+            `SELECT name FROM pragma_table_info('drafts') WHERE name = 'generated_image_path'`,
+          )
+          .get(),
       ).toBeTruthy();
       const appliedSecond = applyMigrations(db);
       expect(appliedSecond).toEqual([]);
