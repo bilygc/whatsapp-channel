@@ -57,7 +57,7 @@ export function buildImagePrompt(input: ImagePromptInput): string {
   const captionCtx = sanitizeCaption(input.captionEs);
   const lines = [
     // 'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos, or box art — an original composition in your own style only.',
-    'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos, or box art but you can have a strong inspiration from it.',
+    'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos, or box art but you can have a strong inspiration from it. you can put the real company names instead of replacing i.e, "Nintendo" with "Nintenda" or "Sony" with "Soni" or "Netflix" with "Streamflix" or "XBOX" with "GBOX".',
     '',
     MOOD_RULES,
     '',
