@@ -12,11 +12,21 @@
  * - Slug: `meta/muse-image` (real, image-capable).
  * - Endpoint: `POST https://openrouter.ai/api/v1/images` — NOT
  *   chat/completions. Same `Authorization: Bearer <OPENROUTER_API_KEY>`.
- * - Minimal body: `{model, prompt, input_references?}` with at most ONE
- *   reference `{type:'image_url', image_url:{url}}`. Never send
- *   `modalities` / `messages` / `image_config` (chat-API fields).
+ * - Minimal body: `{model, prompt, input_references?}` with up to TWO
+ *   references `{type:'image_url', image_url:{url}}` in semantic order
+ *   `[news-image?, channel-logo?]`: the article's news image (https URL)
+ *   first, the channel brand logo (base64 data URL) second. Providers vary
+ *   in how many refs they honour — a 400 on multi-ref is surfaced like
+ *   any other 400 (the ladder/fallback design handles prompt-level
+ *   fallbacks). Never send `modalities` / `messages` / `image_config`
+ *   (chat-API fields).
  * - Response: `{data:[{b64_json, media_type}]}` — base64 only, no hosted
  *   URL. Generations take 60–90s+, so the timeout budget is ≥5 min.
+ *
+ * Data-URL references (the logo) are inlined bytes — they can never fail
+ * with an upstream "unfetchable" error the way an https reference can.
+ * Request bodies are therefore NEVER included in error messages or logs:
+ * they may carry megabytes of logo base64.
  *
  * Machine-readable failure classification (callers branch on this):
  * - 429 → honour `Retry-After`, retryable.
@@ -29,8 +39,11 @@
  *   with explicit content-filter phrasing or a `content_filter` error type —
  *   those classify as policy too.
  * - 400 with error types `image_download_failed` / `image_not_found` →
- *   the reference URL couldn't be fetched upstream: retry ONCE without the
- *   reference (text-only prompt).
+ *   the https reference URL couldn't be fetched upstream: retry ONCE
+ *   text-only (ALL references are dropped — the inlined data-URL logo is
+ *   never "unfetchable upstream", so a selective https-only retry would
+ *   add state-machine complexity for no benefit; the orchestration layer
+ *   re-attaches the logo on its next ladder rung anyway).
  */
 
 export const OPENROUTER_IMAGES_URL = 'https://openrouter.ai/api/v1/images';
@@ -443,16 +456,25 @@ export interface GenerateImageRequest {
   scope: string;
   /** English image prompt (see src/images/prompts.ts). */
   prompt: string;
-  /** Optional https reference (the article's news image). */
-  referenceUrl?: string;
+  /**
+   * Optional references, sent in order (max 2 expected: news + logo).
+   * Semantic order: `[news-image?, channel-logo?]` — the article's news
+   * image (https URL) first, the channel brand logo (base64 data URL)
+   * second. Entries that are neither an https URL nor a
+   * `data:image/<png|jpeg|webp|gif>;base64,` URL (case-tolerant) are
+   * dropped before the wire call.
+   */
+  referenceUrls?: string[];
 }
 
 export interface GeneratedImage {
   bytes: Buffer;
   mediaType: string;
   extension: string;
-  /** False when the call went out text-only (no reference, or reference dropped after a 400). */
+  /** True when the successful call went out with ≥1 reference. */
   referenceUsed: boolean;
+  /** How many references rode on the successful (final) wire call. */
+  referencesUsed: number;
 }
 
 function extensionFor(mediaType: string): string {
@@ -463,17 +485,39 @@ function extensionFor(mediaType: string): string {
   return 'png';
 }
 
-function requestBody(model: string, prompt: string, referenceUrl?: string): string {
+/**
+ * Hard cap on references per wire call (the contract allows at most two:
+ * `[news-image?, channel-logo?]`). Enforced after `isSendableRef` filtering
+ * in both `requestBody` and the `generateImage` retry loop. Exported for tests.
+ */
+export const MAX_SENDABLE_REFERENCES = 2;
+
+function requestBody(model: string, prompt: string, referenceUrls?: string[]): string {
   const body: Record<string, unknown> = { model, prompt };
   // Minimal body: the model advertises no optional params
   // (`supported_parameters: {}`) — never send chat-API fields
   // (`modalities` / `messages` / `image_config`).
-  if (referenceUrl) {
-    body.input_references = [
-      { type: 'image_url', image_url: { url: referenceUrl } },
-    ];
+  const refs = (referenceUrls ?? []).filter(isSendableRef).slice(0, MAX_SENDABLE_REFERENCES);
+  if (refs.length > 0) {
+    body.input_references = refs.map((url) => ({
+      type: 'image_url',
+      image_url: { url },
+    }));
   }
   return JSON.stringify(body);
+}
+
+/**
+ * Only an https reference or an inlined `data:image/…;base64` image ever
+ * goes on the wire — anything else is a caller bug, and sending it would
+ * burn a paid call on a guaranteed 400. The data-URL media-type check is
+ * case-tolerant (`DATA:IMAGE/PNG;BASE64,…` is a legal data URL), and the
+ * payload must carry at least one base64 character (empty payloads are
+ * dropped, never sent).
+ */
+function isSendableRef(url: string): boolean {
+  if (/^https:\/\//.test(url)) return true;
+  return /^data:image\/(png|jpe?g|webp|gif);base64,[\s\S]+$/i.test(url);
 }
 
 /**
@@ -482,8 +526,9 @@ function requestBody(model: string, prompt: string, referenceUrl?: string): stri
  *
  * Retry policy: transient failures (HTTP 429 / 5xx, dropped connections)
  * retry up to 2 times; a 400 with an `image_download_failed` /
- * `image_not_found` type retries ONCE text-only (the reference URL couldn't
- * be fetched upstream); a content-policy refusal (403 policy/refusal type,
+ * `image_not_found` type retries ONCE fully text-only (every reference is
+ * dropped — the https news image couldn't be fetched upstream, and the
+ * data-URL logo is never worth a selective re-send); a content-policy refusal (403 policy/refusal type,
  * or explicit content-filter phrasing / a `content_filter` type at any
  * status) fails immediately with `kind: 'policy'` (the orchestration layer
  * walks progressively reduced prompts — never spend paid generations
@@ -510,14 +555,10 @@ export async function generateImage(
   if (request.prompt.trim() === '') {
     throw fail('empty prompt');
   }
-  // Only an https reference ever goes on the wire — anything else is a
-  // caller bug, and sending it would burn a paid call on a guaranteed 400.
-  const initialRef =
-    request.referenceUrl !== undefined && /^https:\/\//.test(request.referenceUrl)
-      ? request.referenceUrl
-      : undefined;
-
-  let referenceUrl = initialRef;
+  // Only sendable references ever go on the wire (see `isSendableRef`).
+  let referenceUrls = (request.referenceUrls ?? [])
+    .filter(isSendableRef)
+    .slice(0, MAX_SENDABLE_REFERENCES);
   let referenceDropped = false;
 
   for (let attempt = 0; ; attempt += 1) {
@@ -531,7 +572,7 @@ export async function generateImage(
           Authorization: `Bearer ${deps.apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: requestBody(deps.model, request.prompt, referenceUrl),
+        body: requestBody(deps.model, request.prompt, referenceUrls),
         // Fresh stall budget per attempt — a reused signal could already be spent.
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -605,11 +646,15 @@ export async function generateImage(
           kind: 'policy',
         });
       }
-      // Reference-unfetchable: the upstream couldn't fetch the news image —
-      // retry ONCE text-only (does not consume a transient attempt).
+      // Reference-unfetchable: the upstream couldn't fetch the https news
+      // image — retry ONCE text-only (drop ALL refs, logo included: a
+      // data URL is never "unfetchable", and re-sending it alone on a
+      // doomed-shape retry would burn context for no signal). The text-only
+      // retry DOES consume a transient attempt (the loop's `continue`
+      // advances the attempt counter).
       if (res.status === 400 && isReferenceErrorType(errorType)) {
-        if (referenceUrl !== undefined && !referenceDropped) {
-          referenceUrl = undefined;
+        if (referenceUrls.length > 0 && !referenceDropped) {
+          referenceUrls = [];
           referenceDropped = true;
           continue;
         }
@@ -680,7 +725,8 @@ export async function generateImage(
       bytes,
       mediaType,
       extension: extensionFor(mediaType),
-      referenceUsed: referenceUrl !== undefined,
+      referenceUsed: referenceUrls.length > 0,
+      referencesUsed: referenceUrls.length,
     };
   }
 }
