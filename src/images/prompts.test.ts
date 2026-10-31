@@ -78,11 +78,57 @@ describe('buildImagePrompt', () => {
       hasLogoImage: false,
     });
     expect(withoutLogo).not.toMatch(/brand logo/i);
+    expect(withoutLogo).not.toMatch(/mushroom/i);
+    expect(withoutLogo).not.toMatch(/diegetic/i);
   });
 
   it('exempts the attached brand logo from the logos ban', () => {
     const prompt = buildImagePrompt({ title: 't', hasReferenceImage: false, hasLogoImage: true });
     expect(prompt).toMatch(/logos \(except our attached channel logo\)/);
+  });
+
+  it('makes no attached-logo claim when the logo failed to load', () => {
+    const prompt = buildImagePrompt({ title: 't', hasReferenceImage: false, hasLogoImage: false });
+    expect(prompt).not.toMatch(/attached channel logo/i);
+    expect(prompt).not.toMatch(/channel brand logo/i);
+    expect(prompt).not.toMatch(/mushroom/i);
+    expect(prompt).not.toMatch(/diegetic/i);
+    // The ban still applies with no carve-out when nothing is attached.
+    expect(prompt).toMatch(/game screenshots, logos,/);
+  });
+
+  it('logo-only attachment: position-independent logo line, no "no reference" falsehood', () => {
+    const prompt = buildImagePrompt({ title: 't', hasReferenceImage: false, hasLogoImage: true });
+    expect(prompt).toMatch(/One of the attached images is the channel brand logo/i);
+    expect(prompt).not.toMatch(/Second attached image/i);
+    expect(prompt).not.toMatch(/No reference image is attached/i);
+    expect(prompt).toMatch(
+      /The attached image is the channel brand logo \(no news reference\)/i,
+    );
+    expect(prompt).toMatch(/green mushroom/i);
+    expect(prompt).toMatch(/pixel-art/i);
+    expect(prompt).toMatch(/never a shield/i);
+    expect(prompt).toMatch(/diegetic/i);
+    expect(prompt).toMatch(/never cropped/i);
+  });
+
+  it('both news and logo attached: keeps news visual-reference line plus logo line', () => {
+    const prompt = buildImagePrompt({ title: 't', hasReferenceImage: true, hasLogoImage: true });
+    expect(prompt).toMatch(/visual reference/i);
+    expect(prompt).toMatch(/One of the attached images is the channel brand logo/i);
+    expect(prompt).toMatch(/green mushroom/i);
+    expect(prompt).toMatch(/never a shield/i);
+    expect(prompt).toMatch(/diegetic/i);
+    expect(prompt).not.toMatch(/No reference image is attached/i);
+    expect(prompt).not.toMatch(/no news reference/i);
+  });
+
+  it('neither attached: emits the no-reference line and no logo line', () => {
+    const prompt = buildImagePrompt({ title: 't', hasReferenceImage: false, hasLogoImage: false });
+    expect(prompt).toMatch(/No reference image is attached/i);
+    expect(prompt).not.toMatch(/channel brand logo/i);
+    expect(prompt).not.toMatch(/mushroom/i);
+    expect(prompt).not.toMatch(/diegetic/i);
   });
 });
 
@@ -119,6 +165,8 @@ describe('buildImageFallbackPrompt', () => {
       hasLogoImage: true,
     });
     expect(withLogo).toMatch(/channel brand logo/i);
+    expect(withLogo).toMatch(/green mushroom/i);
+    expect(withLogo).toMatch(/never a shield/i);
     expect(withLogo).toMatch(/diegetic/i);
     expect(withLogo).not.toMatch(/\/media\//);
 
@@ -130,6 +178,8 @@ describe('buildImageFallbackPrompt', () => {
     // The mood line may still name the logo conditionally ("if attached"),
     // but the diegetic-integration instruction is logo-only.
     expect(withoutLogo).not.toMatch(/diegetic/i);
+    expect(withoutLogo).not.toMatch(/mushroom/i);
+    expect(withoutLogo).not.toMatch(/channel brand logo/i);
   });
 
   it('notes the news image as a MOOD-only reference when attached (never when not)', () => {
@@ -151,5 +201,52 @@ describe('buildImageFallbackPrompt', () => {
     });
     expect(withoutRef).not.toMatch(/MOOD reference/i);
     expect(withoutRef).not.toMatch(/news image is attached/i);
+  });
+
+  it('fallback logo line is position-independent and logo-only safe', () => {
+    const logoOnly = buildImageFallbackPrompt({
+      title: 't',
+      hasReferenceImage: false,
+      hasLogoImage: true,
+    });
+    expect(logoOnly).toMatch(/One of the attached images is the channel brand logo/i);
+    expect(logoOnly).toMatch(/green mushroom/i);
+    expect(logoOnly).toMatch(/never a shield/i);
+    expect(logoOnly).toMatch(/diegetic/i);
+    expect(logoOnly).not.toMatch(/Second attached image/i);
+    expect(logoOnly).not.toMatch(/MOOD reference/i);
+
+    const neither = buildImageFallbackPrompt({
+      title: 't',
+      hasReferenceImage: false,
+      hasLogoImage: false,
+    });
+    expect(neither).not.toMatch(/diegetic/i);
+    expect(neither).not.toMatch(/mushroom/i);
+    expect(neither).not.toMatch(/attached channel logo/i);
+    expect(neither).not.toMatch(/attached channel-brand logo/i);
+  });
+
+  it('fallback makes no attached-logo claim when the logo failed to load', () => {
+    const withoutLogo = buildImageFallbackPrompt({
+      title: 't',
+      hasReferenceImage: false,
+      hasLogoImage: false,
+    });
+    expect(withoutLogo).not.toMatch(/attached channel logo/i);
+    expect(withoutLogo).not.toMatch(/channel brand logo/i);
+    expect(withoutLogo).not.toMatch(/mushroom/i);
+    expect(withoutLogo).not.toMatch(/diegetic/i);
+
+    const newsOnly = buildImageFallbackPrompt({
+      title: 't',
+      hasReferenceImage: true,
+      hasLogoImage: false,
+    });
+    // Mood line stays generic with no logo suffix when no logo is attached.
+    expect(newsOnly).toMatch(/loose MOOD reference/i);
+    expect(newsOnly).not.toMatch(/channel-brand logo/i);
+    expect(newsOnly).not.toMatch(/mushroom/i);
+    expect(newsOnly).not.toMatch(/diegetic/i);
   });
 });
