@@ -17,6 +17,12 @@ export interface DraftImageDeps extends ImageDeps {
    * used (and stored) as-is — tests pass a tmpdir.
    */
   imagesDir?: string;
+  /**
+   * Channel-logo file to attach as a reference image. Relative paths
+   * resolve from `process.cwd()` (default `media/LogoPowerUpGaming.png`).
+   * Tests pass a fixture (or a bogus path for the missing-logo case).
+   */
+  logoPath?: string;
   /** Seam for tests: replaces the network call. */
   generateFn?: typeof generateImage;
 }
@@ -28,11 +34,105 @@ export interface DraftImageResult {
   bytes: number;
   /** True when the prompt fell back to the no-names variant after a 403. */
   fallbackPrompt: boolean;
-  /** True when the call went out text-only (no usable reference). */
+  /** True when the NEWS reference did not ride on the final wire call. */
   referenceDropped: boolean;
+  /** True when the channel logo rode along as an attached reference. */
+  logoIncluded: boolean;
 }
 
 export const DEFAULT_IMAGES_DIR = path.join('data', 'images');
+
+/** Project-relative path of the channel brand logo (attached, never composited). */
+export const LOGO_RELATIVE_PATH = path.join('media', 'LogoPowerUpGaming.png');
+
+/**
+ * Upper bound for the inlined channel-logo file. Anything bigger is treated
+ * as logo-less (data URLs are inlined bytes — never buffer megabytes into a
+ * paid wire call). Exported for tests.
+ */
+export const LOGO_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Best-effort channel-logo loader: reads the file and returns a
+ * `data:image/<type>;base64,…` URL for `input_references`. NEVER throws —
+ * any read failure (missing file, unreadable bytes, unknown type) yields
+ * `undefined` and generation proceeds without the logo. The bytes are
+ * only ever returned here, never logged or surfaced in error messages.
+ */
+export async function loadLogoDataUrl(logoPath: string): Promise<string | undefined> {
+  try {
+    const abs = path.isAbsolute(logoPath) ? logoPath : path.join(process.cwd(), logoPath);
+    try {
+      const st = await fs.stat(abs);
+      if (st.size > LOGO_MAX_BYTES) {
+        console.warn(`images: logo skipped (too large): ${logoPath}`);
+        return undefined;
+      }
+    } catch {
+      // stat is best-effort only (the read below is authoritative) —
+      // fall through and let the read decide.
+    }
+    let bytes: Buffer;
+    try {
+      bytes = await fs.readFile(abs);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      const reason = code === 'ENOENT' ? 'not found' : 'unreadable';
+      console.warn(`images: logo skipped (${reason}): ${logoPath}`);
+      return undefined;
+    }
+    if (bytes.length === 0) {
+      console.warn(`images: logo skipped (empty): ${logoPath}`);
+      return undefined;
+    }
+    if (bytes.length > LOGO_MAX_BYTES) {
+      console.warn(`images: logo skipped (too large): ${logoPath}`);
+      return undefined;
+    }
+    const mediaType = sniffImageMediaType(bytes) ?? mediaTypeFromExtension(logoPath) ?? 'image/png';
+    return `data:${mediaType};base64,${bytes.toString('base64')}`;
+  } catch {
+    console.warn(`images: logo skipped (unreadable): ${logoPath}`);
+    return undefined;
+  }
+}
+
+/** Magic-byte sniff: PNG, JPEG, GIF, WEBP. Unknown → undefined. */
+function sniffImageMediaType(bytes: Buffer): string | undefined {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    return 'image/png';
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (bytes.length >= 6 && bytes.subarray(0, 6).toString('ascii').startsWith('GIF8')) {
+    return 'image/gif';
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    bytes.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  return undefined;
+}
+
+/** Extension fallback when magic bytes are unrecognized (case-tolerant). */
+function mediaTypeFromExtension(logoPath: string): string | undefined {
+  const ext = path.extname(logoPath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  return undefined;
+}
 
 interface DraftImageRow {
   id: number;
@@ -57,15 +157,24 @@ interface DraftImageRow {
  * attempts after the initial call is acceptable): full prompt + reference,
  * no-names prompt + reference, full prompt without reference, no-names
  * prompt without reference. First success wins; rungs whose input is
- * unavailable are skipped (no reference image). Exhaustion throws a
+ * unavailable are skipped (no news reference image). Exhaustion throws a
  * permanent error listing ONLY the rungs actually tried.
  *
+ * The channel brand logo (see LOGO_RELATIVE_PATH) is attached as an extra
+ * `input_references` entry on EVERY rung whenever it loads — it rides
+ * along with or without the news reference, because a policy refusal is
+ * about prompt/subject content, not the brand mark. A missing/unreadable
+ * logo file never aborts generation (the run simply proceeds logo-less).
+ * "With-reference" therefore means "news image attached"; logo-only rungs
+ * are the ladder's without-reference shape.
+ *
  * Client interplay: a with-reference rung may trigger the client's internal
- * text-only retry (reference unfetchable upstream). That retry covers the
- * same-variant no-reference rung's shape and proves the reference unusable,
- * so the ladder then skips the remaining with-reference rungs and the
- * covered rung instead of running any shape twice. Non-policy failures
- * propagate exactly as before (no ladder).
+ * text-only retry (the https news image unfetchable upstream — the inlined
+ * data-URL logo can never be "unfetchable", and the retry drops all refs
+ * regardless). That retry covers the same-variant no-reference rung's shape
+ * and proves the reference unusable, so the ladder then skips the remaining
+ * with-reference rungs and the covered rung instead of running any shape
+ * twice. Non-policy failures propagate exactly as before (no ladder).
  */
 export async function generateImageForDraft(
   db: Database.Database,
@@ -74,9 +183,11 @@ export async function generateImageForDraft(
 ): Promise<DraftImageResult> {
   const fail = (cause: string): Error =>
     new Error(
-      `images generate failed for draft ${draftId}: ${cause}`
-        .split(deps.apiKey)
-        .join('[redacted]'),
+      deps.apiKey !== ''
+        ? `images generate failed for draft ${draftId}: ${cause}`
+            .split(deps.apiKey)
+            .join('[redacted]')
+        : `images generate failed for draft ${draftId}: ${cause}`,
     );
 
   let row: DraftImageRow | undefined;
@@ -99,18 +210,27 @@ export async function generateImageForDraft(
   const hasReference = typeof row.image_url === 'string' && /^https:\/\//.test(row.image_url);
   const scope = `draft ${draftId}`;
 
+  // Best-effort brand-logo attachment (never aborts the run when missing).
+  const logoDataUrl = await loadLogoDataUrl(deps.logoPath ?? LOGO_RELATIVE_PATH);
+  const hasLogo = logoDataUrl !== undefined;
+
   // Per-rung wire observation: a text-only wire call inside a with-reference
   // rung means the client performed its internal text-only retry (the
-  // reference is unfetchable upstream). Only meaningful on the real-client
-  // path — the generateFn seam bypasses fetch entirely, and a mocked policy
-  // rejection then counts as a direct policy failure with the reference
-  // still usable.
+  // https reference is unfetchable upstream). Text-only means
+  // `input_references` is ABSENT — every ladder rung normally carries ≥1
+  // ref now (the logo rides along even on news-less rungs), so rungs differ
+  // by WHICH refs they carry, not by whether the key exists. Only
+  // meaningful on the real-client path — the generateFn seam bypasses fetch
+  // entirely, and a mocked policy rejection then counts as a direct policy
+  // failure with the reference still usable.
   let rungSawTextOnlyWire = false;
   const observingFetch: typeof fetch = (async (input, init) => {
     try {
       if (typeof init?.body === 'string') {
-        const parsed = JSON.parse(init.body) as { input_references?: unknown };
-        if (parsed.input_references === undefined) rungSawTextOnlyWire = true;
+        // Cheap substring check — never JSON.parse a multi-MB body (the
+        // inlined logo base64 rides here). Absence of the key means the
+        // client performed its internal text-only retry.
+        if (!/"input_references"\s*:/.test(init.body)) rungSawTextOnlyWire = true;
       }
     } catch {
       // Observation is best-effort — never break the call.
@@ -119,11 +239,22 @@ export async function generateImageForDraft(
   }) as typeof fetch;
   const callDeps: ImageDeps = deps.generateFn ? deps : { ...deps, fetchFn: observingFetch };
 
-  const runRung = (prompt: string, withRef: boolean) =>
-    generate(
-      { scope, prompt, ...(withRef ? { referenceUrl: row.image_url as string } : {}) },
+  /**
+   * Reference order on the wire is `[news?, logo?]` (see
+   * `GenerateImageRequest.referenceUrls`): the news image first, the brand
+   * logo second. `withRef` toggles ONLY the news image — the logo rides
+   * along whenever it loaded.
+   */
+  const runRung = (prompt: string, withRef: boolean) => {
+    const referenceUrls = [
+      ...(withRef ? [row.image_url as string] : []),
+      ...(hasLogo ? [logoDataUrl as string] : []),
+    ];
+    return generate(
+      { scope, prompt, ...(referenceUrls.length > 0 ? { referenceUrls } : {}) },
       callDeps,
     );
+  };
 
   interface LadderRung {
     variant: 'full' | 'nonames';
@@ -138,7 +269,12 @@ export async function generateImageForDraft(
       variant: 'full',
       withRef: true,
       label: 'full+reference',
-      prompt: buildImagePrompt({ title: row.title, captionEs: row.caption_es, hasReferenceImage: true }),
+      prompt: buildImagePrompt({
+        title: row.title,
+        captionEs: row.caption_es,
+        hasReferenceImage: true,
+        hasLogoImage: hasLogo,
+      }),
     });
     ladder.push({
       variant: 'nonames',
@@ -148,6 +284,7 @@ export async function generateImageForDraft(
         title: row.title,
         captionEs: row.caption_es,
         hasReferenceImage: true,
+        hasLogoImage: hasLogo,
       }),
     });
   }
@@ -155,7 +292,12 @@ export async function generateImageForDraft(
     variant: 'full',
     withRef: false,
     label: 'full',
-    prompt: buildImagePrompt({ title: row.title, captionEs: row.caption_es, hasReferenceImage: false }),
+    prompt: buildImagePrompt({
+      title: row.title,
+      captionEs: row.caption_es,
+      hasReferenceImage: false,
+      hasLogoImage: hasLogo,
+    }),
   });
   ladder.push({
     variant: 'nonames',
@@ -165,10 +307,13 @@ export async function generateImageForDraft(
       title: row.title,
       captionEs: row.caption_es,
       hasReferenceImage: false,
+      hasLogoImage: hasLogo,
     }),
   });
 
   let image: Awaited<ReturnType<typeof generate>> | undefined;
+  /** Whether the winning rung carried the NEWS reference. */
+  let imageWithRef = false;
   let fallbackPrompt = false;
   // Rungs actually attempted (wire went out), in order — the permanent
   // failure message lists exactly these.
@@ -193,6 +338,7 @@ export async function generateImageForDraft(
         image = await runRung(rung.prompt, rung.withRef);
         markTried(rung.label);
         fallbackPrompt = rung.variant === 'nonames';
+        imageWithRef = rung.withRef;
         break;
       } catch (err) {
         // Non-policy failures behave exactly as before: propagate typed.
@@ -257,7 +403,12 @@ export async function generateImageForDraft(
     path: storedPath,
     bytes: image.bytes.length,
     fallbackPrompt,
-    referenceDropped: !image.referenceUsed,
+    // News-specific: the news image rode on the final wire call only when
+    // the winning rung carried it AND the client didn't drop to its
+    // internal text-only retry. The logo alone still counts as "used", so
+    // a logo-only win is a dropped news reference.
+    referenceDropped: !(imageWithRef && image.referenceUsed),
+    logoIncluded: hasLogo,
   };
 }
 

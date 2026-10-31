@@ -5,7 +5,21 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyMigrations } from '../db/migrate.js';
 import { ImageApiError } from './openrouter.js';
-import { generateImageForDraft } from './run.js';
+import { generateImageForDraft, loadLogoDataUrl, LOGO_MAX_BYTES } from './run.js';
+
+/** Logo-less mode: a path that never exists, so generation proceeds logo-free. */
+const MISSING_LOGO = path.join('no-such-dir', 'no-such-logo.png');
+
+/** Minimal PNG fixture (valid magic bytes) for logo-riding tests. */
+async function writeLogoFixture(dir: string): Promise<{ logoPath: string; dataUrl: string }> {
+  const logoPath = path.join(dir, 'logo.png');
+  const bytes = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from('fake-logo-bytes'),
+  ]);
+  await fs.writeFile(logoPath, bytes);
+  return { logoPath, dataUrl: `data:image/png;base64,${bytes.toString('base64')}` };
+}
 
 function openTestDb(): Database.Database {
   const db = new Database(':memory:');
@@ -81,6 +95,7 @@ describe('generateImageForDraft', () => {
       }) as typeof fetch,
       apiKey: 'k',
       model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
       imagesDir: dir,
       now: () => new Date('2026-10-26T12:00:00.000Z'),
       generateFn: generateFn as never,
@@ -104,6 +119,7 @@ describe('generateImageForDraft', () => {
       }) as typeof fetch,
       apiKey: 'k',
       model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
       imagesDir: dir,
       now: () => new Date('2026-10-26T12:05:00.000Z'),
       generateFn: generateFn as never,
@@ -129,16 +145,17 @@ describe('generateImageForDraft', () => {
       }) as typeof fetch,
       apiKey: 'k',
       model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
       imagesDir: dir,
       generateFn: generateFn as never,
     });
 
     expect(generateFn).toHaveBeenCalledOnce();
     const [request] = generateFn.mock.calls[0] as unknown as [
-      { scope: string; prompt: string; referenceUrl?: string },
+      { scope: string; prompt: string; referenceUrls?: string[] },
     ];
     expect(request.scope).toBe(`draft ${id}`);
-    expect(request.referenceUrl).toBe('https://img.example/news.jpg');
+    expect(request.referenceUrls).toEqual(['https://img.example/news.jpg']);
     expect(request.prompt).toContain('Elden Ring DLC announced');
   });
 
@@ -160,13 +177,77 @@ describe('generateImageForDraft', () => {
       }) as typeof fetch,
       apiKey: 'k',
       model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
       imagesDir: dir,
       generateFn: generateFn as never,
     });
 
-    const [request] = generateFn.mock.calls[0] as unknown as [{ referenceUrl?: string }];
-    expect(request.referenceUrl).toBeUndefined();
+    const [request] = generateFn.mock.calls[0] as unknown as [{ referenceUrls?: string[] }];
+    expect(request.referenceUrls).toBeUndefined();
     expect(result.referenceDropped).toBe(true);
+    expect(result.logoIncluded).toBe(false);
+  });
+
+  it('attaches the news image AND the logo in order on every rung (logo rides along)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    const id = seedDraft(db);
+    const { logoPath, dataUrl: logoDataUrl } = await writeLogoFixture(dir);
+    const generateFn = okGenerate();
+
+    const result = await generateImageForDraft(db, id, {
+      fetchFn: (async () => {
+        throw new Error('no network');
+      }) as typeof fetch,
+      apiKey: 'k',
+      model: 'meta/muse-image',
+      logoPath,
+      imagesDir: dir,
+      generateFn: generateFn as never,
+    });
+
+    expect(generateFn).toHaveBeenCalledOnce();
+    const [request] = generateFn.mock.calls[0] as unknown as [
+      { scope: string; prompt: string; referenceUrls?: string[] },
+    ];
+    // Semantic order: [news, logo].
+    expect(request.referenceUrls).toEqual(['https://img.example/news.jpg', logoDataUrl]);
+    expect(request.prompt).toMatch(/channel brand logo/i);
+    expect(result.referenceDropped).toBe(false);
+    expect(result.logoIncluded).toBe(true);
+  });
+
+  it('proceeds without the logo when the logo file cannot be read (never aborts)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    const id = seedDraft(db);
+    const generateFn = okGenerate();
+
+    const result = await generateImageForDraft(db, id, {
+      fetchFn: (async () => {
+        throw new Error('no network');
+      }) as typeof fetch,
+      apiKey: 'k',
+      model: 'meta/muse-image',
+      logoPath: path.join(dir, 'no-such-logo.png'),
+      imagesDir: dir,
+      generateFn: generateFn as never,
+    });
+
+    const [request] = generateFn.mock.calls[0] as unknown as [
+      { scope: string; prompt: string; referenceUrls?: string[] },
+    ];
+    expect(request.referenceUrls).toEqual(['https://img.example/news.jpg']);
+    expect(request.prompt).not.toMatch(/brand logo/i);
+    expect(result.referenceDropped).toBe(false);
+    expect(result.logoIncluded).toBe(false);
+    expect(
+      (db.prepare('SELECT generated_image_path FROM drafts WHERE id = ?').get(id) as {
+        generated_image_path: string;
+      }).generated_image_path,
+    ).toBe(result.path);
   });
 
   it('leaves the DB untouched when generation fails (no partial state)', async () => {
@@ -188,6 +269,7 @@ describe('generateImageForDraft', () => {
         }) as typeof fetch,
         apiKey: 'k',
         model: 'meta/muse-image',
+        logoPath: MISSING_LOGO,
         imagesDir: dir,
         generateFn: failing as never,
       }),
@@ -227,6 +309,7 @@ describe('generateImageForDraft', () => {
       }) as typeof fetch,
       apiKey: 'k',
       model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
       imagesDir: dir,
       generateFn: generateFn as never,
     });
@@ -261,6 +344,7 @@ describe('generateImageForDraft', () => {
         }) as typeof fetch,
         apiKey: 'k',
         model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
         imagesDir: dir,
         generateFn: generateFn as never,
       }),
@@ -280,6 +364,7 @@ describe('generateImageForDraft', () => {
         }) as typeof fetch,
         apiKey: 'k',
         model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
         imagesDir: dir,
         generateFn: generateFn as never,
       }),
@@ -298,6 +383,7 @@ describe('generateImageForDraft', () => {
         }) as typeof fetch,
         apiKey: 'k',
         model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
         generateFn: okGenerate() as never,
       }),
     ).rejects.toThrow(/^images generate failed for draft 1: /);
@@ -317,6 +403,7 @@ describe('generateImageForDraft', () => {
         }) as typeof fetch,
         apiKey: 'k',
         model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
         imagesDir: path.join(blocker, 'sub'),
         generateFn: okGenerate() as never,
       }),
@@ -345,6 +432,7 @@ describe('generateImageForDraft', () => {
       }) as typeof fetch,
       apiKey: key,
       model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
       imagesDir: dir,
       generateFn: failing as never,
     }).then(
@@ -352,6 +440,25 @@ describe('generateImageForDraft', () => {
       (e: Error) => e.message,
     );
     expect(err).not.toContain(key);
+  });
+
+  it('does not mangle messages when apiKey is empty', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    // An empty key must not interleave '[redacted]' per character.
+    await expect(
+      generateImageForDraft(db, 999, {
+        fetchFn: (async () => {
+          throw new Error('no network');
+        }) as typeof fetch,
+        apiKey: '',
+        model: 'meta/muse-image',
+        logoPath: MISSING_LOGO,
+        imagesDir: dir,
+        generateFn: okGenerate() as never,
+      }),
+    ).rejects.toThrow('images generate failed for draft 999: draft not found');
   });
 });
 
@@ -389,6 +496,7 @@ describe('generateImageForDraft policy ladder', () => {
       }) as typeof fetch,
       apiKey: 'k',
       model: 'meta/muse-image',
+      logoPath: MISSING_LOGO,
       imagesDir: dir,
       now: () => new Date('2026-10-26T12:00:00.000Z'),
       ...extra,
@@ -433,16 +541,16 @@ describe('generateImageForDraft policy ladder', () => {
     expect(generateFn).toHaveBeenCalledTimes(3);
     const requests = generateFn.mock.calls.map((c) => c[0]) as Array<{
       prompt: string;
-      referenceUrl?: string;
+      referenceUrls?: string[];
     }>;
     // Rung 1: full + reference.
-    expect(requests[0].referenceUrl).toBe('https://img.example/news.jpg');
+    expect(requests[0].referenceUrls).toEqual(['https://img.example/news.jpg']);
     expect(requests[0].prompt).not.toMatch(/do NOT depict any named/i);
     // Rung 2: no-names + reference.
-    expect(requests[1].referenceUrl).toBe('https://img.example/news.jpg');
+    expect(requests[1].referenceUrls).toEqual(['https://img.example/news.jpg']);
     expect(requests[1].prompt).toMatch(/do NOT depict any named/i);
     // Rung 3: full, no reference — stops the ladder.
-    expect(requests[2].referenceUrl).toBeUndefined();
+    expect(requests[2].referenceUrls).toBeUndefined();
     expect(requests[2].prompt).not.toMatch(/do NOT depict any named/i);
     expect(result.fallbackPrompt).toBe(false);
     expect(result.referenceDropped).toBe(true);
@@ -467,12 +575,50 @@ describe('generateImageForDraft policy ladder', () => {
     expect(generateFn).toHaveBeenCalledTimes(4);
     const requests = generateFn.mock.calls.map((c) => c[0]) as Array<{
       prompt: string;
-      referenceUrl?: string;
+      referenceUrls?: string[];
     }>;
-    expect(requests[3].referenceUrl).toBeUndefined();
+    expect(requests[3].referenceUrls).toBeUndefined();
     expect(requests[3].prompt).toMatch(/do NOT depict any named/i);
     expect(result.fallbackPrompt).toBe(true);
     expect(result.referenceDropped).toBe(true);
+    expect(storedPath(db, id)).toBe(result.path);
+  });
+
+  it('keeps the logo riding along on news-less rungs after policy refusals', async () => {
+    const db = openDb();
+    const dir = await tmpDir();
+    const id = seedDraft(db);
+    const { logoPath, dataUrl: logoDataUrl } = await writeLogoFixture(dir);
+    const generateFn = vi
+      .fn()
+      .mockRejectedValueOnce(policyErr())
+      .mockRejectedValueOnce(policyErr())
+      .mockResolvedValueOnce({
+        bytes: Buffer.from('logo-only-bytes'),
+        mediaType: 'image/png',
+        extension: 'png',
+        referenceUsed: true,
+      });
+
+    const result = await generateImageForDraft(
+      db,
+      id,
+      baseDeps(dir, { logoPath, generateFn: generateFn as never }) as never,
+    );
+
+    expect(generateFn).toHaveBeenCalledTimes(3);
+    const requests = generateFn.mock.calls.map((c) => c[0]) as Array<{
+      prompt: string;
+      referenceUrls?: string[];
+    }>;
+    // Rungs 1–2 carry [news, logo]; rung 3 is the news-less shape but keeps the logo.
+    expect(requests[0].referenceUrls).toEqual(['https://img.example/news.jpg', logoDataUrl]);
+    expect(requests[1].referenceUrls).toEqual(['https://img.example/news.jpg', logoDataUrl]);
+    expect(requests[2].referenceUrls).toEqual([logoDataUrl]);
+    for (const r of requests) expect(r.prompt).toMatch(/channel brand logo/i);
+    expect(result.fallbackPrompt).toBe(false);
+    expect(result.referenceDropped).toBe(true);
+    expect(result.logoIncluded).toBe(true);
     expect(storedPath(db, id)).toBe(result.path);
   });
 
@@ -521,9 +667,9 @@ describe('generateImageForDraft policy ladder', () => {
     expect(generateFn).toHaveBeenCalledTimes(2);
     const requests = generateFn.mock.calls.map((c) => c[0]) as Array<{
       prompt: string;
-      referenceUrl?: string;
+      referenceUrls?: string[];
     }>;
-    for (const r of requests) expect(r.referenceUrl).toBeUndefined();
+    for (const r of requests) expect(r.referenceUrls).toBeUndefined();
     expect(requests[0].prompt).not.toMatch(/do NOT depict any named/i);
     expect(requests[1].prompt).toMatch(/do NOT depict any named/i);
     expect(result.fallbackPrompt).toBe(true);
@@ -556,13 +702,19 @@ describe('generateImageForDraft policy ladder', () => {
     const db = openDb();
     const dir = await tmpDir();
     const id = seedDraft(db);
-    const bodies: Array<{ prompt: string; withRef: boolean }> = [];
+    const { logoPath, dataUrl: logoDataUrl } = await writeLogoFixture(dir);
+    const bodies: Array<{ prompt: string; newsRef: boolean; refs: string[] }> = [];
     const fetchFn = vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
       const parsed = JSON.parse(init?.body as string) as {
         prompt: string;
-        input_references?: unknown;
+        input_references?: Array<{ image_url: { url: string } }>;
       };
-      bodies.push({ prompt: parsed.prompt, withRef: parsed.input_references !== undefined });
+      const refs = (parsed.input_references ?? []).map((r) => r.image_url.url);
+      bodies.push({
+        prompt: parsed.prompt,
+        newsRef: refs.some((u) => u === 'https://img.example/news.jpg'),
+        refs,
+      });
       const payload =
         bodies.length === 1
           ? { error: { message: 'could not fetch reference', metadata: { error_type: 'image_download_failed' } } }
@@ -589,25 +741,30 @@ describe('generateImageForDraft policy ladder', () => {
       fetchFn: fetchFn as unknown as typeof fetch,
       apiKey: 'k',
       model: 'meta/muse-image',
+      logoPath,
       imagesDir: dir,
       now: () => new Date('2026-10-26T12:00:00.000Z'),
       sleep: async () => {},
     });
 
-    // Wire 1: rung 1 (full+ref). Wire 2: the client's internal text-only
-    // retry (full, no ref — rung 3's shape). Wire 3: rung 4 directly.
+    // Wire 1: rung 1 (full + news + logo). Wire 2: the client's internal
+    // text-only retry (full, zero refs — rung 3's news-less shape). Wire 3:
+    // rung 4 (no-names + logo) directly.
     expect(fetchFn).toHaveBeenCalledTimes(3);
-    expect(bodies[0].withRef).toBe(true);
+    expect(bodies[0].newsRef).toBe(true);
+    expect(bodies[0].refs).toEqual(['https://img.example/news.jpg', logoDataUrl]);
     expect(bodies[0].prompt).not.toMatch(/do NOT depict any named/i);
-    expect(bodies[1]).toMatchObject({ withRef: false });
+    expect(bodies[1].refs).toEqual([]);
     expect(bodies[1].prompt).not.toMatch(/do NOT depict any named/i);
-    expect(bodies[2].withRef).toBe(false);
+    expect(bodies[2].newsRef).toBe(false);
+    expect(bodies[2].refs).toEqual([logoDataUrl]);
     expect(bodies[2].prompt).toMatch(/do NOT depict any named/i);
-    // Full-no-ref went out exactly once; no-names+reference never went out.
-    expect(bodies.filter((b) => !b.withRef && !/do NOT depict any named/i.test(b.prompt))).toHaveLength(1);
-    expect(bodies.filter((b) => b.withRef && /do NOT depict any named/i.test(b.prompt))).toHaveLength(0);
+    // Full text-only went out exactly once; no-names+news never went out.
+    expect(bodies.filter((b) => b.refs.length === 0 && !/do NOT depict any named/i.test(b.prompt))).toHaveLength(1);
+    expect(bodies.filter((b) => b.newsRef && /do NOT depict any named/i.test(b.prompt))).toHaveLength(0);
     expect(result.fallbackPrompt).toBe(true);
     expect(result.referenceDropped).toBe(true);
+    expect(result.logoIncluded).toBe(true);
     expect(storedPath(db, id)).toBe(result.path);
   });
 
@@ -615,19 +772,25 @@ describe('generateImageForDraft policy ladder', () => {
     const db = openDb();
     const dir = await tmpDir();
     const id = seedDraft(db);
+    const { logoPath } = await writeLogoFixture(await tmpDir());
     const fetchFn = vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
-      const parsed = JSON.parse(init?.body as string) as { input_references?: unknown };
+      const parsed = JSON.parse(init?.body as string) as {
+        input_references?: Array<{ image_url: { url: string } }>;
+      };
+      const refs = (parsed.input_references ?? []).map((r) => r.image_url.url);
+      // Only the NEWS ref is ever "unfetchable" — the inlined logo URL is
+      // always servable, so logo-only rungs get the policy verdict instead.
+      const hasNews = refs.some((u) => u === 'https://img.example/news.jpg');
       const status = 400;
-      const payload =
-        parsed.input_references !== undefined
-          ? { error: { message: 'could not fetch reference', metadata: { error_type: 'image_download_failed' } } }
-          : {
-              error: {
-                message:
-                  'The response was filtered due to the prompt triggering our content management policy.',
-                code: 400,
-              },
-            };
+      const payload = hasNews
+        ? { error: { message: 'could not fetch reference', metadata: { error_type: 'image_download_failed' } } }
+        : {
+            error: {
+              message:
+                'The response was filtered due to the prompt triggering our content management policy.',
+              code: 400,
+            },
+          };
       return {
         ok: false,
         status,
@@ -641,6 +804,7 @@ describe('generateImageForDraft policy ladder', () => {
       fetchFn: fetchFn as unknown as typeof fetch,
       apiKey: 'k',
       model: 'meta/muse-image',
+      logoPath,
       imagesDir: dir,
       now: () => new Date('2026-10-26T12:00:00.000Z'),
       sleep: async () => {},
@@ -657,5 +821,143 @@ describe('generateImageForDraft policy ladder', () => {
     );
     expect(storedPath(db, id)).toBeNull();
     expect(await fs.readdir(dir).catch(() => [])).toEqual([]);
+  });
+
+  it('wire observation never JSON.parses the request body (cheap substring check)', async () => {
+    const db = openDb();
+    const dir = await tmpDir();
+    const id = seedDraft(db);
+    const { logoPath } = await writeLogoFixture(dir);
+    // Any JSON.parse of a request body (which always carries the logo's
+    // multi-MB base64 when refs ride along) is recorded — the response
+    // parse below must be the only parse that happens.
+    const origParse = JSON.parse.bind(JSON);
+    const parsedRequestBodies: string[] = [];
+    vi.spyOn(JSON, 'parse').mockImplementation(
+      (text: string, reviver?: (this: unknown, key: string, value: unknown) => unknown) => {
+        if (text.includes('input_references')) parsedRequestBodies.push(text);
+        return reviver ? origParse(text, reviver) : origParse(text);
+      },
+    );
+    const payload = {
+      data: [{ b64_json: Buffer.from('ok-bytes').toString('base64'), media_type: 'image/png' }],
+    };
+    const fetchFn = vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+      // The request body really does carry the logo bytes (multi-KB here,
+      // multi-MB in prod) — parsing it would be observable above.
+      expect(typeof init?.body === 'string' && init.body.includes('input_references')).toBe(
+        true,
+      );
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        arrayBuffer: async () =>
+          new TextEncoder().encode(JSON.stringify(payload)).buffer as ArrayBuffer,
+        body: { cancel: async () => {} },
+      } as unknown as Response;
+    });
+
+    const result = await generateImageForDraft(db, id, baseDeps(dir, {
+      logoPath,
+      fetchFn: fetchFn as unknown as typeof fetch,
+    }) as never);
+
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(parsedRequestBodies).toEqual([]);
+    expect(result.logoIncluded).toBe(true);
+    expect(result.referenceDropped).toBe(false);
+    expect(storedPath(db, id)).toBe(result.path);
+  });
+});
+
+describe('loadLogoDataUrl', () => {
+  let tmpDirs: string[] = [];
+  afterEach(async () => {
+    for (const dir of tmpDirs) await fs.rm(dir, { recursive: true, force: true });
+    tmpDirs = [];
+  });
+
+  async function tmpDir(): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'whatsapp-logo-'));
+    tmpDirs.push(dir);
+    return dir;
+  }
+
+  it('returns undefined (never throws) when the file is missing', async () => {
+    await expect(loadLogoDataUrl(path.join('no-such-dir', 'no-such-logo.png'))).resolves
+      .toBeUndefined();
+  });
+
+  it('returns undefined for an empty file', async () => {
+    const dir = await tmpDir();
+    const p = path.join(dir, 'empty.png');
+    await fs.writeFile(p, Buffer.alloc(0));
+    await expect(loadLogoDataUrl(p)).resolves.toBeUndefined();
+  });
+
+  it('sniffs PNG magic bytes even under a misleading extension', async () => {
+    const dir = await tmpDir();
+    const p = path.join(dir, 'logo.bin');
+    const bytes = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('x'),
+    ]);
+    await fs.writeFile(p, bytes);
+    await expect(loadLogoDataUrl(p)).resolves.toBe(
+      `data:image/png;base64,${bytes.toString('base64')}`,
+    );
+  });
+
+  it('sniffs JPEG magic bytes (case-tolerant .JPG extension also works)', async () => {
+    const dir = await tmpDir();
+    const p = path.join(dir, 'logo.JPG');
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from('x')]);
+    await fs.writeFile(p, bytes);
+    await expect(loadLogoDataUrl(p)).resolves.toBe(
+      `data:image/jpeg;base64,${bytes.toString('base64')}`,
+    );
+  });
+
+  it('falls back to the file extension for unrecognized bytes', async () => {
+    const dir = await tmpDir();
+    const p = path.join(dir, 'logo.webp');
+    const bytes = Buffer.from('not-really-webp');
+    await fs.writeFile(p, bytes);
+    await expect(loadLogoDataUrl(p)).resolves.toBe(
+      `data:image/webp;base64,${bytes.toString('base64')}`,
+    );
+  });
+
+  it('defaults to image/png for unrecognized bytes and extension', async () => {
+    const dir = await tmpDir();
+    const p = path.join(dir, 'logo.bin');
+    const bytes = Buffer.from('mystery-bytes');
+    await fs.writeFile(p, bytes);
+    await expect(loadLogoDataUrl(p)).resolves.toBe(
+      `data:image/png;base64,${bytes.toString('base64')}`,
+    );
+  });
+
+  it('returns undefined + logs too large when the file exceeds LOGO_MAX_BYTES', async () => {
+    expect(LOGO_MAX_BYTES).toBe(2 * 1024 * 1024);
+    const dir = await tmpDir();
+    const p = path.join(dir, 'big.png');
+    await fs.writeFile(p, Buffer.alloc(LOGO_MAX_BYTES + 1));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await expect(loadLogoDataUrl(p)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledOnce();
+    const [message] = warn.mock.calls[0] as [string];
+    expect(message).toContain('too large');
+    expect(message).toContain(p);
+    // Category only — never bytes, never a stack.
+    expect(message).not.toContain(String(LOGO_MAX_BYTES + 1));
+  });
+
+  it('returns undefined (never throws) when logoPath is a directory', async () => {
+    const dir = await tmpDir();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await expect(loadLogoDataUrl(dir)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalled();
   });
 });
