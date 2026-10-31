@@ -24,9 +24,11 @@ export interface ImagePromptInput {
   /** Whether the article's news image is attached as a visual reference. */
   hasReferenceImage: boolean;
   /**
-   * Whether the channel brand logo is attached as a second reference
-   * image. When true the prompt must tell the model the logo is attached
-   * (the model cannot see the repo filesystem — never mention a path).
+   * Whether the channel brand logo is attached as a (lone or second)
+   * reference image. When true the prompt must tell the model the logo is
+   * attached (the model cannot see the repo filesystem — never mention a
+   * path). Position on the wire may vary ([news?, logo?] or [logo] when no
+   * news image).
    */
   hasLogoImage: boolean;
 }
@@ -53,13 +55,15 @@ const MOOD_RULES = [
 
 /**
  * Brand-logo integration note, emitted ONLY when the logo rides along as
- * an attached reference image. The model cannot read the repo filesystem,
- * so the instruction references "the attached image", never a path. The
- * logo must live INSIDE the scene (diegetic), never as a flat overlay —
- * no watermark-style compositing is done anywhere in this pipeline.
+ * an attached reference image (lone or second — position on the wire may
+ * vary: [news?, logo?] or [logo] when no news image). The model cannot
+ * read the repo filesystem, so the instruction references "the attached
+ * image", never a path. The logo must live INSIDE the scene (diegetic),
+ * never as a flat overlay — no watermark-style compositing is done
+ * anywhere in this pipeline.
  */
 const LOGO_LINE =
-  'Second attached image (when present) is the channel brand logo: integrate it creatively as a diegetic element of the scene (in-world poster, sticker, neon sign, jersey patch, hologram) rather than a flat watermark; but respect the logo design, dont change it, never cropped.';
+  'One of the attached images is the channel brand logo: integrate it creatively as a diegetic element of the scene (in-world poster, sticker, neon sign, jersey patch, hologram) rather than a flat watermark; respect the logo design, dont change it, never cropped.';
 
 /**
  * Build the English image prompt: static guidelines (original art only +
@@ -71,9 +75,12 @@ const LOGO_LINE =
 export function buildImagePrompt(input: ImagePromptInput): string {
   const safeTitle = sanitizeTitle(input.title);
   const captionCtx = sanitizeCaption(input.captionEs);
+  const openingLine = input.hasLogoImage
+    ? 'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos (except our attached channel logo), or box art but you can have a strong inspiration from it. you can put the real company names instead of replacing i.e, "Nintendo" with "Nintenda" or "Sony" with "Soni" or "Netflix" with "Streamflix" or "XBOX" with "GBOX".'
+    : 'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos, or box art but you can have a strong inspiration from it. you can put the real company names instead of replacing i.e, "Nintendo" with "Nintenda" or "Sony" with "Soni" or "Netflix" with "Streamflix" or "XBOX" with "GBOX".';
   const lines = [
     // 'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos, or box art — an original composition in your own style only.',
-    'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos (except our attached channel logo), or box art but you can have a strong inspiration from it. you can put the real company names instead of replacing i.e, "Nintendo" with "Nintenda" or "Sony" with "Soni" or "Netflix" with "Streamflix" or "XBOX" with "GBOX".',
+    openingLine,
     'DO NOT put any other video game blog or news names in the image, only the company names and the game title.',
     '',
     MOOD_RULES,
@@ -87,6 +94,10 @@ export function buildImagePrompt(input: ImagePromptInput): string {
   if (input.hasReferenceImage) {
     lines.push(
       'Use the attached news image as a VISUAL REFERENCE for the subject, setting, and characters (same game/topic), but cooler — re-imagine it in your own original style, do not reproduce it pixel for pixel.',
+    );
+  } else if (input.hasLogoImage) {
+    lines.push(
+      'The attached image is the channel brand logo (no news reference) — invent the scene from the story subject above and integrate the logo as instructed below.',
     );
   } else {
     lines.push('No reference image is attached — invent the scene from the story subject above.');
@@ -105,10 +116,16 @@ export function buildImagePrompt(input: ImagePromptInput): string {
  */
 export function buildImageFallbackPrompt(input: ImagePromptInput): string {
   const captionCtx = sanitizeCaption(input.captionEs);
+  const openingLine = input.hasLogoImage
+    ? 'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos (except our attached channel logo), or box art but you can have a strong inspiration from it.'
+    : 'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos, or box art but you can have a strong inspiration from it.';
+  const namedBanLine = input.hasLogoImage
+    ? 'IMPORTANT: do NOT depict any named, trademarked, or recognizable franchise characters, mascots, logos (except our attached channel logo), or titles. Use only GENERIC, original characters and settings that evoke the mood — style description only, never names.'
+    : 'IMPORTANT: do NOT depict any named, trademarked, or recognizable franchise characters, mascots, logos, or titles. Use only GENERIC, original characters and settings that evoke the mood — style description only, never names.';
   const lines = [
-    'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos (except our attached channel logo), or box art but you can have a strong inspiration from it.',
+    openingLine,
     '',
-    'IMPORTANT: do NOT depict any named, trademarked, or recognizable franchise characters, mascots, logos (except our attached channel logo), or titles. Use only GENERIC, original characters and settings that evoke the mood — style description only, never names.',
+    namedBanLine,
     '',
     MOOD_RULES,
     '',
@@ -120,7 +137,9 @@ export function buildImageFallbackPrompt(input: ImagePromptInput): string {
   }
   if (input.hasReferenceImage) {
     lines.push(
-      'A news image is attached as a loose MOOD reference only — do not reproduce its characters or composition; create a generic scene in the same spirit. The attached channel-brand logo (if attached) still applies.',
+      input.hasLogoImage
+        ? 'A news image is attached as a loose MOOD reference only — do not reproduce its characters or composition; create a generic scene in the same spirit. The attached channel-brand logo (if attached) still applies.'
+        : 'A news image is attached as a loose MOOD reference only — do not reproduce its characters or composition; create a generic scene in the same spirit.',
     );
   }
   if (input.hasLogoImage) {
