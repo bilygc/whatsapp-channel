@@ -46,6 +46,19 @@ const MOOD_RULES = [
 ].join('\n');
 
 /**
+<<<<<<< Updated upstream
+=======
+ * Brand-logo integration note, emitted ONLY when the logo rides along as
+ * an attached reference image. The model cannot read the repo filesystem,
+ * so the instruction references "the attached image", never a path. The
+ * logo must live INSIDE the scene (diegetic), never as a flat overlay —
+ * no watermark-style compositing is done anywhere in this pipeline.
+ */
+const LOGO_LINE =
+  'Second attached image (when present) is the channel brand logo: integrate it creatively as a diegetic element of the scene (in-world poster, sticker, neon sign, jersey patch, hologram) rather than a flat watermark; but respect the logo design, dont change it, never cropped.';
+
+/**
+>>>>>>> Stashed changes
  * Build the English image prompt: static guidelines (original art only +
  * mood rules) plus the sanitized title as quoted subject matter and a short
  * caption context. When a reference image is attached, the prompt says so
