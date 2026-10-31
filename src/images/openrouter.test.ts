@@ -8,6 +8,7 @@ import {
   IMAGE_TIMEOUT_MS,
   isPolicyRefusal,
   isReferenceUnfetchable,
+  MAX_SENDABLE_REFERENCES,
   OPENROUTER_IMAGES_URL,
   resolveImageConfig,
   ImageApiError,
@@ -91,12 +92,17 @@ describe('generateImage', () => {
   it('posts the minimal body to the images endpoint (never chat-API fields)', async () => {
     const d = deps();
     const image = await generateImage(
-      { scope: 'draft 1', prompt: 'an exciting game cover', referenceUrl: 'https://img.example/x.jpg' },
+      {
+        scope: 'draft 1',
+        prompt: 'an exciting game cover',
+        referenceUrls: ['https://img.example/x.jpg'],
+      },
       d,
     );
     expect(image.bytes).toEqual(Buffer.from('fake-png-bytes'));
     expect(image.extension).toBe('png');
     expect(image.referenceUsed).toBe(true);
+    expect(image.referencesUsed).toBe(1);
     expect(d.fetchFn).toHaveBeenCalledOnce();
     const [url, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
       string,
@@ -127,18 +133,186 @@ describe('generateImage', () => {
     expect(JSON.parse(init.body as string)).not.toHaveProperty('input_references');
   });
 
-  it('never sends a non-https reference (text-only instead of a doomed 400)', async () => {
+  it('never sends a non-https non-data reference (text-only instead of a doomed 400)', async () => {
     const d = deps();
     const image = await generateImage(
-      { scope: 'draft 1', prompt: 'x', referenceUrl: 'http://insecure.example/x.jpg' },
+      { scope: 'draft 1', prompt: 'x', referenceUrls: ['http://insecure.example/x.jpg'] },
       d,
     );
     expect(image.referenceUsed).toBe(false);
+    expect(image.referencesUsed).toBe(0);
     const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
       string,
       RequestInit,
     ];
     expect(JSON.parse(init.body as string)).not.toHaveProperty('input_references');
+  });
+
+  it('sends https + data-URL references in order (news first, logo second)', async () => {
+    const d = deps();
+    const logo = `data:image/png;base64,${Buffer.from('fake-logo').toString('base64')}`;
+    const image = await generateImage(
+      {
+        scope: 'draft 1',
+        prompt: 'x',
+        referenceUrls: ['https://img.example/news.jpg', logo],
+      },
+      d,
+    );
+    expect(image.referenceUsed).toBe(true);
+    expect(image.referencesUsed).toBe(2);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body.input_references).toEqual([
+      { type: 'image_url', image_url: { url: 'https://img.example/news.jpg' } },
+      { type: 'image_url', image_url: { url: logo } },
+    ]);
+  });
+
+  it('accepts data-URL references case-tolerantly and drops anything else', async () => {
+    const d = deps();
+    const upper = `DATA:IMAGE/PNG;BASE64,${Buffer.from('fake-logo').toString('base64')}`;
+    const image = await generateImage(
+      {
+        scope: 'draft 1',
+        prompt: 'x',
+        referenceUrls: ['not-a-url', upper, 'ftp://example.com/x.png', 'https://img.example/ok.jpg'],
+      },
+      d,
+    );
+    expect(image.referenceUsed).toBe(true);
+    expect(image.referencesUsed).toBe(2);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    const refs = (
+      JSON.parse(init.body as string) as {
+        input_references: Array<{ image_url: { url: string } }>;
+      }
+    ).input_references;
+    expect(refs.map((r) => r.image_url.url)).toEqual([upper, 'https://img.example/ok.jpg']);
+  });
+
+  it('caps sendable references at MAX_SENDABLE_REFERENCES (3 refs → first 2 sent)', async () => {
+    expect(MAX_SENDABLE_REFERENCES).toBe(2);
+    const d = deps();
+    const image = await generateImage(
+      {
+        scope: 'draft 1',
+        prompt: 'x',
+        referenceUrls: [
+          'https://img.example/a.jpg',
+          'https://img.example/b.jpg',
+          'https://img.example/c.jpg',
+        ],
+      },
+      d,
+    );
+    expect(image.referencesUsed).toBe(2);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    const refs = (
+      JSON.parse(init.body as string) as {
+        input_references: Array<{ image_url: { url: string } }>;
+      }
+    ).input_references;
+    expect(refs.map((r) => r.image_url.url)).toEqual([
+      'https://img.example/a.jpg',
+      'https://img.example/b.jpg',
+    ]);
+  });
+
+  it('drops empty-base64 data URLs (payload must carry ≥1 character)', async () => {
+    const d = deps();
+    const image = await generateImage(
+      {
+        scope: 'draft 1',
+        prompt: 'x',
+        referenceUrls: ['data:image/png;base64,', 'https://img.example/ok.jpg'],
+      },
+      d,
+    );
+    expect(image.referencesUsed).toBe(1);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    const refs = (
+      JSON.parse(init.body as string) as {
+        input_references: Array<{ image_url: { url: string } }>;
+      }
+    ).input_references;
+    expect(refs.map((r) => r.image_url.url)).toEqual(['https://img.example/ok.jpg']);
+  });
+
+  it('goes text-only when the only reference is an empty data URL', async () => {
+    const d = deps();
+    const image = await generateImage(
+      { scope: 'draft 1', prompt: 'x', referenceUrls: ['data:image/png;base64,'] },
+      d,
+    );
+    expect(image.referenceUsed).toBe(false);
+    expect(image.referencesUsed).toBe(0);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    expect(JSON.parse(init.body as string)).not.toHaveProperty('input_references');
+  });
+
+  it('internal retry on 400 drops ALL refs including the data-URL logo', async () => {
+    const logo = `data:image/png;base64,${Buffer.from('fake-logo').toString('base64')}`;
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        errorResponse(400, {
+          error: { message: 'fetch failed', metadata: { error_type: 'image_not_found' } },
+        }),
+      )
+      .mockResolvedValueOnce(okImageResponse());
+    const image = await generateImage(
+      {
+        scope: 'draft 3',
+        prompt: 'x',
+        referenceUrls: ['https://img.example/gone.jpg', logo],
+      },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(
+      (fetchFn.mock.calls[1] as [string, RequestInit])[1].body as string,
+    ) as Record<string, unknown>;
+    expect(secondBody).not.toHaveProperty('input_references');
+    expect(image.referenceUsed).toBe(false);
+    expect(image.referencesUsed).toBe(0);
+  });
+
+  it('never leaks reference (logo) bytes into error messages', async () => {
+    const b64 = Buffer.from('logo-bytes-marker').toString('base64');
+    const logo = `data:image/png;base64,${b64}`;
+    const fetchFn = vi.fn(async () => errorResponse(400, { error: { message: 'bad prompt' } }));
+    const err = await generateImage(
+      {
+        scope: 'draft 1',
+        prompt: 'x',
+        referenceUrls: ['https://img.example/x.jpg', logo],
+      },
+      deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
+    ).catch((e: Error) => e.message);
+    // The logo rode on the wire…
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(
+      (JSON.parse(init.body as string) as { input_references: unknown[] }).input_references,
+    ).toHaveLength(2);
+    // …but its bytes never surface in the typed error.
+    expect(err).toMatch(/^images generate failed for draft 1: /);
+    expect(err).not.toContain(b64);
   });
 
   it('uses a ≥5-minute abort budget (generations take 60–90s+)', async () => {
@@ -250,7 +424,7 @@ describe('generateImage', () => {
       )
       .mockResolvedValueOnce(okImageResponse());
     const image = await generateImage(
-      { scope: 'draft 3', prompt: 'x', referenceUrl: 'https://img.example/gone.jpg' },
+      { scope: 'draft 3', prompt: 'x', referenceUrls: ['https://img.example/gone.jpg'] },
       deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep }),
     );
     expect(fetchFn).toHaveBeenCalledTimes(2);
@@ -260,6 +434,7 @@ describe('generateImage', () => {
     ) as Record<string, unknown>;
     expect(secondBody).not.toHaveProperty('input_references');
     expect(image.referenceUsed).toBe(false);
+    expect(image.referencesUsed).toBe(0);
   });
 
   it('surfaces reference-unfetchable when the text-only retry also 400s', async () => {
@@ -269,7 +444,7 @@ describe('generateImage', () => {
       }),
     );
     const err = await generateImage(
-      { scope: 'draft 3', prompt: 'x', referenceUrl: 'https://img.example/gone.jpg' },
+      { scope: 'draft 3', prompt: 'x', referenceUrls: ['https://img.example/gone.jpg'] },
       deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
     ).catch((e) => e);
     expect(isReferenceUnfetchable(err)).toBe(true);
@@ -487,7 +662,7 @@ describe('generateImage', () => {
       }),
     );
     const err = await generateImage(
-      { scope: 'draft 3', prompt: 'x', referenceUrl: 'https://img.example/gone.jpg' },
+      { scope: 'draft 3', prompt: 'x', referenceUrls: ['https://img.example/gone.jpg'] },
       deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep: async () => {} }),
     ).catch((e) => e);
     expect(isReferenceUnfetchable(err)).toBe(true);
@@ -572,7 +747,7 @@ describe('generateImage content-filter policy classification', () => {
       }),
     );
     const err = await generateImage(
-      { scope: 'draft 48', prompt: 'x', referenceUrl: 'https://img.example/x.jpg' },
+      { scope: 'draft 48', prompt: 'x', referenceUrls: ['https://img.example/x.jpg'] },
       deps({ fetchFn: fetchFn as unknown as typeof fetch, sleep }),
     ).catch((e) => e);
     expect(err).toBeInstanceOf(ImageApiError);
