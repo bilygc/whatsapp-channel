@@ -175,8 +175,8 @@ describe('buildImageFallbackPrompt', () => {
       hasReferenceImage: true,
       hasLogoImage: false,
     });
-    // The mood line may still name the logo conditionally ("if attached"),
-    // but the diegetic-integration instruction is logo-only.
+    // The diegetic-integration instruction is logo-only; the news mood
+    // line carries no logo suffix when no logo is attached.
     expect(withoutLogo).not.toMatch(/diegetic/i);
     expect(withoutLogo).not.toMatch(/mushroom/i);
     expect(withoutLogo).not.toMatch(/channel brand logo/i);
