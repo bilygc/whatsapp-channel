@@ -60,10 +60,12 @@ const MOOD_RULES = [
  * read the repo filesystem, so the instruction references "the attached
  * image", never a path. The logo must live INSIDE the scene (diegetic),
  * never as a flat overlay — no watermark-style compositing is done
- * anywhere in this pipeline.
+ * anywhere in this pipeline. The text description below is intentional:
+ * a text anchor PLUS the attached pixels keep the model on-brand across
+ * providers.
  */
 const LOGO_LINE =
-  'One of the attached images is the channel brand logo: integrate it creatively as a diegetic element of the scene (in-world poster, sticker, neon sign, jersey patch, hologram) rather than a flat watermark; respect the logo design, dont change it, never cropped.';
+  "One of the attached images is the channel brand logo: a pixel-art green mushroom (bright-green cap, two white square eyes, cream stem, black-and-white outline) with 'PowerUp Gaming' pixel wordmark ('Power' white, 'Up' green, 'Gaming' white). Reproduce it faithfully: always a mushroom — never a shield, lightning bolt, skull, or other icon; same pixel-art style, same green/white/cream/black palette, same proportions. Place it creatively as a diegetic element (poster, sticker, patch, flag, mural) at readable size, never cropped, never restyled, never recolored. If the full lockup is unreadable at size, prefer the mushroom icon alone over a wrong icon or misspelled text.";
 
 /**
  * Build the English image prompt: static guidelines (original art only +
