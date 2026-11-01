@@ -130,6 +130,23 @@ describe('buildImagePrompt', () => {
     expect(prompt).not.toMatch(/mushroom/i);
     expect(prompt).not.toMatch(/diegetic/i);
   });
+
+  it('renders in-image text in Spanish via a top-of-prompt directive (not a buried mood bullet)', () => {
+    const prompt = buildImagePrompt({ title: 't', hasReferenceImage: false,
+      hasLogoImage: false });
+    expect(prompt).toMatch(/TEXT LANGUAGE:.*MUST be in Spanish.*never in English/i);
+    // Directive sits right after the opening line — before mood rules, security, subject.
+    const lines = prompt.split('\n');
+    const langIdx = lines.findIndex((l) => /TEXT LANGUAGE:/.test(l));
+    const moodIdx = lines.findIndex((l) => /Mood rules/.test(l));
+    const securityIdx = lines.findIndex((l) => /^SECURITY:/.test(l));
+    expect(langIdx).toBeGreaterThanOrEqual(1);
+    expect(langIdx).toBeLessThanOrEqual(2);
+    expect(langIdx).toBeLessThan(moodIdx);
+    expect(langIdx).toBeLessThan(securityIdx);
+    // Old weak phrasing is gone (dedupe — not kept in both places).
+    expect(prompt).not.toMatch(/The text generated in the image should be in Spanish/i);
+  });
 });
 
 describe('buildImageFallbackPrompt', () => {
@@ -248,5 +265,20 @@ describe('buildImageFallbackPrompt', () => {
     expect(newsOnly).not.toMatch(/channel-brand logo/i);
     expect(newsOnly).not.toMatch(/mushroom/i);
     expect(newsOnly).not.toMatch(/diegetic/i);
+  });
+
+  it('fallback renders in-image text in Spanish via a top-of-prompt directive', () => {
+    const prompt = buildImageFallbackPrompt({ title: 't', hasReferenceImage: false,
+      hasLogoImage: false });
+    expect(prompt).toMatch(/TEXT LANGUAGE:.*MUST be in Spanish.*never in English/i);
+    const lines = prompt.split('\n');
+    const langIdx = lines.findIndex((l) => /TEXT LANGUAGE:/.test(l));
+    const moodIdx = lines.findIndex((l) => /Mood rules/.test(l));
+    const namedBanIdx = lines.findIndex((l) => /do NOT depict any named/i.test(l));
+    expect(langIdx).toBeGreaterThanOrEqual(1);
+    expect(langIdx).toBeLessThanOrEqual(2);
+    expect(langIdx).toBeLessThan(moodIdx);
+    expect(langIdx).toBeLessThan(namedBanIdx);
+    expect(prompt).not.toMatch(/The text generated in the image should be in Spanish/i);
   });
 });
