@@ -6,7 +6,7 @@ import type { RssSource } from './rss.js';
  * fix the URL here, no orchestrator changes needed.
  */
 export const RSS_SOURCES: RssSource[] = [
-  { id: 'ign', feedUrl: 'https://feeds.ign.com/ign/all' },
+  { id: 'ign', feedUrl: 'https://feeds.feedburner.com/ign/games-all' },
   { id: 'polygon', feedUrl: 'https://www.polygon.com/rss/index.xml' },
   { id: 'eurogamer', feedUrl: 'https://www.eurogamer.net/feed' },
   { id: 'gematsu', feedUrl: 'https://www.gematsu.com/feed' },
