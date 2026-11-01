@@ -63,6 +63,9 @@ export const KEYWORDS = [
   'trailer',
   'lanzamiento',
   'secuela',
+  'league of legends',
+  'emulator',
+  'emulador',
 ];
 
 const KEYWORD_POINTS = 8;

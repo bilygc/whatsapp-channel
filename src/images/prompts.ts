@@ -51,8 +51,17 @@ const MOOD_RULES = [
   '- Bad news about a game (delays, cancellations, shutdowns): the main character looking sad or disappointed.',
   '- Console or platform hacked/breached: a dark, moody style suggesting bleak prospects for the company.',
   '- Game with bad reviews or harsh critics: the main character looking upset or awkward.',
-  '- The text generated in the image should be in Spanish, but the text in the prompt is in English.',
 ].join('\n');
+
+/**
+ * In-image text language: the whole prompt is English, so without a strong
+ * top-of-prompt directive image models default to rendering English text.
+ * This standalone line sits right after the opening line(s) of both
+ * builders so any wordmarks, signs, headlines, UI, or captions rendered
+ * inside the image come out in Spanish.
+ */
+const TEXT_LANGUAGE_LINE =
+  'TEXT LANGUAGE: any text rendered inside the image (wordmarks, signs, headlines, UI, captions) MUST be in Spanish — never in English.';
 
 /**
  * Brand-logo integration note, emitted ONLY when the logo rides along as
@@ -84,6 +93,7 @@ export function buildImagePrompt(input: ImagePromptInput): string {
   const lines = [
     // 'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos, or box art — an original composition in your own style only.',
     openingLine,
+    TEXT_LANGUAGE_LINE,
     'DO NOT put any other video game blog or news names in the image, only the company names and the game title.',
     '',
     MOOD_RULES,
@@ -127,6 +137,7 @@ export function buildImageFallbackPrompt(input: ImagePromptInput): string {
     : 'IMPORTANT: do NOT depict any named, trademarked, or recognizable franchise characters, mascots, logos, or titles. Use only GENERIC, original characters and settings that evoke the mood — style description only, never names.';
   const lines = [
     openingLine,
+    TEXT_LANGUAGE_LINE,
     '',
     namedBanLine,
     '',
