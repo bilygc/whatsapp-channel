@@ -51,6 +51,7 @@ const MOOD_RULES = [
   '- Bad news about a game (delays, cancellations, shutdowns): the main character looking sad or disappointed.',
   '- Console or platform hacked/breached: a dark, moody style suggesting bleak prospects for the company.',
   '- Game with bad reviews or harsh critics: the main character looking upset or awkward.',
+  '- The text generated in the image should be in Spanish, but the text in the prompt is in English.',
 ].join('\n');
 
 /**
