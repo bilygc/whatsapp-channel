@@ -15,7 +15,7 @@ import { formatArticleLine, formatCliFailure } from './format.js';
 config();
 
 async function main(): Promise<void> {
-  const { apiKey, model } = resolveLlmConfig();
+  const { apiKey, model, maxTokens } = resolveLlmConfig();
   if (!apiKey) {
     console.error('write failed: OPENROUTER_API_KEY is not set (see .env.example).');
     process.exitCode = 1;
@@ -28,8 +28,8 @@ async function main(): Promise<void> {
     console.log(`Using model: ${model}`);
     const summary = await runWriter(db, {
       now: () => new Date(),
-      generate: (article) => generateCaption(article, { fetchFn: fetch, apiKey, model }),
-      generateX: (article) => generateXPost(article, { fetchFn: fetch, apiKey, model }),
+      generate: (article) => generateCaption(article, { fetchFn: fetch, apiKey, model, maxTokens }),
+      generateX: (article) => generateXPost(article, { fetchFn: fetch, apiKey, model, maxTokens }),
     });
     for (const r of summary.results) {
       console.log(formatArticleLine(r));

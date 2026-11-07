@@ -71,7 +71,7 @@ async function main(): Promise<void> {
   try {
     applyMigrations(db);
 
-    const { apiKey, model } = resolveLlmConfig();
+    const { apiKey, model, maxTokens } = resolveLlmConfig();
     const { token, chatId } = resolveTelegramConfig();
     if (!apiKey) {
       console.warn(
@@ -84,7 +84,12 @@ async function main(): Promise<void> {
     const summary = await runDeliver(db, {
       limit,
       generate: apiKey
-        ? (article) => generateCaption(article, { fetchFn: fetch, apiKey, model })
+        ? (article) => generateCaption(article, { fetchFn: fetch, apiKey, model, maxTokens })
+        : undefined,
+      // Same two-call shape as `npm run write`: consistency across paths
+      // matters more than the extra LLM call per article (plan cap is 4/run).
+      generateX: apiKey
+        ? (article) => generateXPost(article, { fetchFn: fetch, apiKey, model, maxTokens })
         : undefined,
       // Same two-call shape as `npm run write`: consistency across paths
       // matters more than the extra LLM call per article (plan cap is 4/run).
