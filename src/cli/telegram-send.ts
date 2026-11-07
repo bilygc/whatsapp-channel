@@ -115,6 +115,7 @@ async function main(): Promise<void> {
   const db = openDb(dbPath);
   try {
     applyMigrations(db);
+    logDbBriefing(dbPath, db);
     if (args.resend) {
       const count = rearmDrafts(db, args.ids);
       console.log(

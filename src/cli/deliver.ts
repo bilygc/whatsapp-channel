@@ -71,6 +71,7 @@ async function main(): Promise<void> {
   }
   try {
     applyMigrations(db);
+    logDbBriefing(dbPath, db);
 
     const { apiKey, model, maxTokens } = resolveLlmConfig();
     const { token, chatId } = resolveTelegramConfig();

@@ -26,6 +26,7 @@ async function main(): Promise<void> {
   const db = openDb(dbPath);
   try {
     applyMigrations(db);
+    logDbBriefing(dbPath, db);
     console.log(`Using model: ${model}`);
     const summary = await runWriter(db, {
       now: () => new Date(),
