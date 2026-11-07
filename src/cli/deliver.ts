@@ -3,7 +3,8 @@
  * `npm run deliver` — the cron deliver step (M5 automation): runs the
  * post-fetch chain select → write → telegramSend in one process via
  * `runDeliver` (the same library functions the individual CLIs call — no
- * duplicated logic). Honest chain semantics:
+ * duplicated logic). The write step makes the same two LLM calls per article
+ * as `npm run write` (Spanish caption + Twitter/X variant). Honest chain semantics:
  * - 0 selected → fine outcome: skip write+send, exit 0.
  * - Write partial/total failure → send still runs; exit 0 unless send failed
  *   everything (warning lines flag the write trouble).
@@ -15,7 +16,7 @@ import { config } from 'dotenv';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
-import { generateCaption, resolveLlmConfig } from '../writer/openrouter.js';
+import { generateCaption, generateXPost, resolveLlmConfig } from '../writer/openrouter.js';
 import { resolveTelegramConfig } from '../telegram/config.js';
 import { SELECT_DEFAULT_LIMIT } from '../selector/select.js';
 import { runDeliver } from '../deliver/run.js';
@@ -85,6 +86,11 @@ async function main(): Promise<void> {
       generate: apiKey
         ? (article) => generateCaption(article, { fetchFn: fetch, apiKey, model })
         : undefined,
+      // Same two-call shape as `npm run write`: consistency across paths
+      // matters more than the extra LLM call per article (plan cap is 4/run).
+      generateX: apiKey
+        ? (article) => generateXPost(article, { fetchFn: fetch, apiKey, model })
+        : undefined,
       fetchFn: fetch,
       token,
       chatId,
@@ -108,7 +114,7 @@ async function main(): Promise<void> {
       }
       console.log(
         `write: selected=${summary.write.total} written=${summary.write.written} ` +
-          `failed=${summary.write.failed}.`,
+          `failed=${summary.write.failed} x_variants=${summary.write.xWritten}.`,
       );
     }
     if (summary.writeSkippedReason) {

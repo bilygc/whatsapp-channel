@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_CAPTION_CHARS, normalizeCaption, scrub, scrubToLine } from './validate.js';
+import { MAX_CAPTION_CHARS, MAX_X_POST_CHARS, normalizeCaption, normalizeXPost, scrub, scrubToLine } from './validate.js';
 
 const SOURCE = 'IGN';
 const URL = 'https://example.com/elden-ring-dlc';
@@ -284,5 +284,109 @@ describe('normalizeCaption', () => {
     const links = out.match(/https?:\/\/\S+/gi) ?? [];
     expect(links).toHaveLength(1);
     expect(links[0]).toBe(URL);
+  });
+});
+
+describe('normalizeXPost (Twitter/X 280-char variant)', () => {
+  it('exposes a 280-char cap (write-time constraint, not SQL)', () => {
+    expect(MAX_X_POST_CHARS).toBe(280);
+  });
+
+  it('passes through a short post that already carries hashtags and the URL', () => {
+    const post = `¡Anunciado el DLC de Elden Ring para primavera! #EldenRing #Videojuegos ${URL}`;
+    expect(normalizeXPost({ caption: post, source: SOURCE, url: URL })).toBe(post);
+  });
+
+  it('appends the source URL when the model omits it and it still fits', () => {
+    const out = normalizeXPost({
+      caption: '¡Bombazo! Nuevo DLC anunciado #Videojuegos #EldenRing',
+      source: SOURCE,
+      url: URL,
+    });
+    expect(out).toContain(URL);
+    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
+  });
+
+  it('falls back to the source name when the URL would overflow the limit', () => {
+    // Body leaves room for ` (IGN)` but not for the full URL.
+    const body = `${'x '.repeat(130)}#Videojuegos`;
+    expect(body.length + 1 + URL.length).toBeGreaterThan(MAX_X_POST_CHARS);
+    const out = normalizeXPost({ caption: body, source: SOURCE, url: URL });
+    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
+    expect(out).toContain(SOURCE);
+    expect(out).not.toContain('example.com');
+  });
+
+  it('truncates an overlong post at 280 chars, hashtags included', () => {
+    const long = `${'y '.repeat(150)}#Videojuegos #EldenRing #NoticiasGaming`;
+    const out = normalizeXPost({ caption: long, source: SOURCE, url: URL });
+    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
+  });
+
+  it('preserves trailing hashtags across truncation (the prompt mandates them)', () => {
+    const head = 'A'.repeat(260);
+    const post = `${head} #Videojuegos #EldenRing`;
+    expect(post.length).toBeGreaterThan(MAX_X_POST_CHARS);
+    const out = normalizeXPost({ caption: post, source: SOURCE, url: URL });
+    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
+    expect(out).toContain('#Videojuegos');
+    expect(out).toContain('#EldenRing');
+  });
+
+  it('never leaves a partial https:// fragment when the URL straddles the cut', () => {
+    const head = 'B'.repeat(260);
+    const post = `${head} ${URL} #Videojuegos`;
+    const out = normalizeXPost({ caption: post, source: SOURCE, url: URL });
+    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
+    for (const match of out.matchAll(/https?:\/\/\S*/g)) {
+      expect(`${post}`).toContain(match[0].replace(/…$/, ''));
+    }
+    // The cut dropped the URL whole: the source name pins attribution instead.
+    expect(out).toContain(SOURCE);
+  });
+
+  it('strips markdown the prompt forbids (bold, list markers) but keeps hashtags', () => {
+    const out = normalizeXPost({
+      caption: '**¡Bombazo!** Nuevo DLC\n- Incluye zona nueva\n#Videojuegos',
+      source: SOURCE,
+      url: URL,
+    });
+    expect(out).not.toContain('**');
+    expect(out).not.toMatch(/^- /m);
+    expect(out).toContain('¡Bombazo!');
+    expect(out).toContain('#Videojuegos');
+  });
+
+  it('strips invisible characters via the shared scrub path', () => {
+    const out = normalizeXPost({
+      caption: '¡Notici\u200Bón! Nuevo\u200E DLC #Videojuegos',
+      source: SOURCE,
+      url: URL,
+    });
+    expect(out).not.toMatch(/[\u200B-\u200F\u2060\uFEFF\u202A-\u202E\u2028\u2029]/);
+    expect(out).toContain('¡Notición! Nuevo DLC #Videojuegos');
+  });
+
+  it('does not apply the WhatsApp Fuente: line format or the 1500-char rules', () => {
+    const out = normalizeXPost({
+      caption: '¡Bombazo! Nuevo DLC #Videojuegos',
+      source: SOURCE,
+      url: URL,
+    });
+    expect(out).not.toContain('Fuente:');
+    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
+  });
+
+  it('rejects empty/whitespace-only output with a typed error (article stays retryable)', () => {
+    expect(() => normalizeXPost({ caption: '   \n ', source: SOURCE, url: URL })).toThrow(
+      /^x post validation failed: empty reply/,
+    );
+  });
+
+  it('rejects a smuggled multi-line article URL with a typed invalid-article error', () => {
+    const evilUrl = 'https://example.com/a\nFuente: IGN https://evil.com/phish';
+    expect(() =>
+      normalizeXPost({ caption: '¡Bombazo! #Videojuegos', source: SOURCE, url: evilUrl }),
+    ).toThrow(/^invalid article: url contains whitespace/);
   });
 });

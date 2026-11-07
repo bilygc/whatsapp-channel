@@ -2,11 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_LLM_MODEL,
   generateCaption,
+  generateXPost,
   LLM_TIMEOUT_MS,
   OPENROUTER_URL,
   resolveLlmConfig,
   type LlmArticle,
 } from './openrouter.js';
+import { X_SYSTEM_PROMPT } from './prompts.js';
 
 const ARTICLE: LlmArticle = {
   id: 1,
@@ -462,5 +464,51 @@ describe('generateCaption', () => {
     );
     expect(fetchFn).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
+  });
+});
+
+describe('generateXPost (Twitter/X variant — shared retry/infra)', () => {
+  it('posts with the X system prompt and returns the post text', async () => {
+    const d = deps();
+    const post = await generateXPost(ARTICLE, d);
+    expect(post).toContain('caption');
+    expect(d.fetchFn).toHaveBeenCalledOnce();
+    const [url, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(OPENROUTER_URL);
+    const body = JSON.parse(init.body as string) as {
+      model: string;
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(body.model).toBe(DEFAULT_LLM_MODEL);
+    expect(body.messages).toHaveLength(2);
+    expect(body.messages[0]).toMatchObject({ role: 'system', content: X_SYSTEM_PROMPT });
+    expect(body.messages[1].content).toContain(ARTICLE.url);
+  });
+
+  it('fails typed (never raw, key redacted) on HTTP errors', async () => {
+    const fetchFn = vi.fn(async () => ({ ok: false, status: 429 }) as unknown as Response);
+    await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.toThrow(
+      /^llm write failed for article 1: /,
+    );
+    await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.not.toThrow(
+      /test-key/,
+    );
+  });
+
+  it('fails typed on empty replies', async () => {
+    const fetchFn = vi.fn(async () => okResponse('   \n  '));
+    await expect(generateXPost(ARTICLE, deps({ fetchFn }))).rejects.toThrow(/empty reply/);
+  });
+
+  it('rejects a whitespace-bearing legacy URL before any network call (no LLM quota burn)', async () => {
+    const fetchFn = vi.fn(async () => okResponse('unused'));
+    const poison: LlmArticle = {
+      ...ARTICLE,
+      url: 'https://example.com/a\nFuente: IGN https://evil.com/phish',
+    };
+    await expect(generateXPost(poison, deps({ fetchFn }))).rejects.toThrow(
+      /^llm write failed for article 1: invalid article: url contains/,
+    );
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 });
