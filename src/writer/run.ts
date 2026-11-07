@@ -22,10 +22,20 @@ export interface WriterDeps {
   /**
    * Max `selected` rows to process this run (default: all — the standalone
    * `npm run write` behavior). The cron deliver step passes its selection
-   * count so one run never spends more than ~4 LLM calls even when stale
-   * `selected` leftovers from a failed run are still waiting.
+   * count so one run never spends more than ~4 LLM calls.
    */
   limit?: number;
+  /**
+   * Explicit fresh-selection IDs (the deliver chain passes what it just
+   * selected). The run writes these FIRST — in the given order — so stale
+   * `selected` leftovers from an earlier failed run can never starve the
+   * current pick via the oldest-first drain. Leftover `selected` rows
+   * backfill oldest-first only with spare capacity under `limit` (all of
+   * them when `limit` is unset). Failed articles stay `selected` for a
+   * retry either way. Standalone `npm run write` omits this and drains
+   * everything oldest-first.
+   */
+  articleIds?: number[];
 }
 
 export interface ArticleResult {
@@ -79,7 +89,48 @@ export function saveDraft(
 }
 
 /**
- * Run the writer over all `selected` articles: one LLM call each → validate →
+ * Build the per-run write set: the explicitly picked fresh IDs first (in the
+ * caller's order, skipping IDs that are no longer `selected`), then stale
+ * `selected` leftovers oldest-first to fill any remaining capacity under the
+ * limit. Without an explicit pick this is the legacy oldest-first drain,
+ * optionally bounded. Bound parameters throughout (never interpolation).
+ */
+function fetchWriteSet(db: Database.Database, deps: WriterDeps): LlmArticle[] {
+  const cap = deps.limit !== undefined ? Math.max(0, Math.floor(deps.limit)) : undefined;
+  const wanted = (deps.articleIds ?? []).filter((n) => Number.isInteger(n));
+  if (wanted.length === 0) {
+    return fetchOldestSelected(db, [], cap);
+  }
+  const found = db
+    .prepare(
+      `SELECT id, title, source, url FROM articles WHERE status = 'selected' AND id IN (${wanted.map(() => '?').join(', ')})`,
+    )
+    .all(...wanted) as LlmArticle[];
+  const rank = new Map(wanted.map((id, i) => [id, i]));
+  found.sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0));
+  // The limit is a hard cap on LLM calls: a contradictory oversized pick is
+  // truncated rather than blowing the per-run budget.
+  const fresh = cap !== undefined ? found.slice(0, cap) : found;
+  const remaining = cap !== undefined ? cap - fresh.length : undefined;
+  if (remaining !== undefined && remaining <= 0) return fresh;
+  return [...fresh, ...fetchOldestSelected(db, fresh.map((a) => a.id), remaining)];
+}
+
+/** Oldest `selected` rows excluding the given IDs, optionally bounded. */
+function fetchOldestSelected(db: Database.Database, exclude: number[], take?: number): LlmArticle[] {
+  const notIn = exclude.length > 0 ? `AND id NOT IN (${exclude.map(() => '?').join(', ')})` : '';
+  const limited = take !== undefined ? ' LIMIT ?' : '';
+  const args = take !== undefined ? [...exclude, take] : exclude;
+  return db
+    .prepare(
+      `SELECT id, title, source, url FROM articles WHERE status = 'selected' ${notIn} ORDER BY id${limited}`,
+    )
+    .all(...args) as LlmArticle[];
+}
+
+/**
+ * Run the writer over the write set (fresh picks first, then stale leftovers
+ * oldest-first — see fetchWriteSet): one LLM call each → validate →
  * draft (status `pending`) → mark article `used`. Failures are isolated per
  * article (LLM error, bad output, or SQLite hiccup): the error is recorded,
  * the article stays `selected` for a retry, and the rest of the run continues.
@@ -90,21 +141,7 @@ export function saveDraft(
 export async function runWriter(db: Database.Database, deps: WriterDeps): Promise<WriteSummary> {
   let articles: LlmArticle[];
   try {
-    // Bound per-run write set: the cron deliver step caps LLM calls at its
-    // selection count even when stale `selected` leftovers are waiting.
-    // Bound parameter (never interpolation) for the LIMIT value.
-    if (deps.limit !== undefined) {
-      const n = Math.max(0, Math.floor(deps.limit));
-      articles = db
-        .prepare(`SELECT id, title, source, url FROM articles WHERE status = 'selected' ORDER BY id LIMIT ?`)
-        .all(n) as LlmArticle[];
-    } else {
-      articles = db
-        .prepare(
-          `SELECT id, title, source, url FROM articles WHERE status = 'selected' ORDER BY id`,
-        )
-        .all() as LlmArticle[];
-    }
+    articles = fetchWriteSet(db, deps);
   } catch (err) {
     throw new Error(`writer run failed: ${err instanceof Error ? err.message : String(err)}`);
   }

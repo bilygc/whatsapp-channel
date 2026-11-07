@@ -190,6 +190,122 @@ describe('runWriter', () => {
   });
 });
 
+describe('runWriter with explicit articleIds (fresh-selection priority)', () => {
+  let dbs: Database.Database[] = [];
+  afterEach(() => {
+    for (const db of dbs) db.close();
+    dbs = [];
+    vi.restoreAllMocks();
+  });
+
+  it('writes the fresh picked IDs first instead of draining stale leftovers oldest-first', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    // Stale leftovers from an earlier failed run (low IDs, still `selected`).
+    const stale = seedSelected(db, [
+      { url: 'https://example.com/stale-1' },
+      { url: 'https://example.com/stale-2' },
+    ]);
+    // Freshly selected this run (high IDs).
+    const fresh = seedSelected(db, [
+      { url: 'https://example.com/fresh-1' },
+      { url: 'https://example.com/fresh-2' },
+    ]);
+    void stale;
+
+    const summary = await runWriter(db, { ...deps(), limit: 2, articleIds: fresh });
+
+    expect(summary).toMatchObject({ total: 2, written: 2, failed: 0 });
+    const drafted = (
+      db.prepare('SELECT article_id FROM drafts').all() as Array<{ article_id: number }>
+    ).map((d) => d.article_id);
+    expect(drafted.sort((a, b) => a - b)).toEqual([...fresh].sort((a, b) => a - b));
+    // Stale leftovers wait — capacity was fully spent on the fresh picks.
+    for (const id of stale) {
+      const row = db.prepare('SELECT status FROM articles WHERE id = ?').get(id) as {
+        status: string;
+      };
+      expect(row.status).toBe('selected');
+    }
+  });
+
+  it('backfills leftover selected rows oldest-first when capacity remains after the fresh IDs', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const stale = seedSelected(db, [
+      { url: 'https://example.com/stale-1' },
+      { url: 'https://example.com/stale-2' },
+    ]);
+    const fresh = seedSelected(db, [{ url: 'https://example.com/fresh-1' }]);
+
+    const seen: number[] = [];
+    // Limit 2 = 1 fresh pick + 1 slot of spare capacity for the backlog.
+    const summary = await runWriter(
+      db,
+      deps({
+        limit: 2,
+        articleIds: fresh,
+        generate: async (article) => {
+          seen.push(article.id);
+          return `🔥 ${article.title}\n\nFuente: ${article.source} ${article.url}`;
+        },
+      }),
+    );
+
+    // Fresh first, then the oldest stale leftover; the newest stale waits.
+    expect(seen).toEqual([fresh[0], stale[0]]);
+    expect(summary).toMatchObject({ total: 2, written: 2, failed: 0 });
+    const left = db.prepare('SELECT status FROM articles WHERE id = ?').get(stale[1]) as {
+      status: string;
+    };
+    expect(left.status).toBe('selected');
+  });
+
+  it('a failed fresh write keeps status=selected for retry (draft untouched, rest continue)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [{ url: 'https://example.com/stale-1' }]);
+    const fresh = seedSelected(db, [
+      { url: 'https://example.com/fresh-ok' },
+      { url: 'https://example.com/fresh-bad' },
+    ]);
+
+    const summary = await runWriter(
+      db,
+      deps({
+        generate: async (article) => {
+          if (article.url.endsWith('/fresh-bad')) throw new Error('llm write failed: timeout');
+          return `🔥 caption\n\nFuente: ${article.source} ${article.url}`;
+        },
+        limit: 2,
+        articleIds: fresh,
+      }),
+    );
+
+    expect(summary).toMatchObject({ total: 2, written: 1, failed: 1 });
+    const bad = db.prepare('SELECT status FROM articles WHERE id = ?').get(fresh[1]) as {
+      status: string;
+    };
+    expect(bad.status).toBe('selected');
+    const drafts = db.prepare('SELECT COUNT(*) AS n FROM drafts').get() as { n: number };
+    expect(drafts.n).toBe(1);
+  });
+
+  it('ignores unknown article IDs in the explicit list without throwing (backfills stale)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const stale = seedSelected(db, [{ url: 'https://example.com/stale-1' }]);
+
+    const summary = await runWriter(db, { ...deps(), limit: 1, articleIds: [999999] });
+
+    expect(summary).toMatchObject({ total: 1, written: 1, failed: 0 });
+    const row = db.prepare('SELECT status FROM articles WHERE id = ?').get(stale[0]) as {
+      status: string;
+    };
+    expect(row.status).toBe('used');
+  });
+});
+
 describe('saveDraft (dedupe / regenerate semantics)', () => {
   let dbs: Database.Database[] = [];
   afterEach(() => {

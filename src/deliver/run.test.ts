@@ -331,6 +331,70 @@ describe('runDeliver (select → write → telegramSend chain)', () => {
     expect(stale.status).toBe('selected');
   });
 
+  it('threads the fresh selection IDs into the writer so stale leftovers cannot starve them', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedNew(db, ['https://example.com/a', 'https://example.com/b']);
+    // Stale leftover from a previous failed run (low ID, still `selected`).
+    seedNew(db, ['https://example.com/stale']);
+    db.prepare(`UPDATE articles SET status = 'selected' WHERE url = 'https://example.com/stale'`).run();
+
+    let seenIds: number[] | undefined;
+    let seenLimit: number | undefined;
+    const writeFn = vi.fn(
+      async (
+        _db: unknown,
+        wdeps: { now: () => Date; generate: unknown; limit?: number; articleIds?: number[] },
+      ): Promise<WriteSummary> => {
+        seenIds = wdeps.articleIds;
+        seenLimit = wdeps.limit;
+        return { results: [], total: 0, written: 0, failed: 0, exitCode: 0 };
+      },
+    );
+
+    const summary = await runDeliver(db, deps({ writeFn }));
+
+    expect(summary.selected).toBe(2);
+    expect(writeFn).toHaveBeenCalledOnce();
+    const freshIds = (
+      db.prepare(`SELECT id FROM articles WHERE url LIKE 'https://example.com/a%'
+        OR url LIKE 'https://example.com/b%'`).all() as Array<{ id: number }>
+    ).map((r) => r.id);
+    // Writer receives exactly the fresh pick (plus the selection-count bound).
+    expect(seenIds?.sort((a, b) => a - b)).toEqual(freshIds.sort((a, b) => a - b));
+    expect(seenLimit).toBe(2);
+  });
+
+  it('integration: a run writes exactly what it selected, stale leftovers wait when capacity is spent', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    // Stale leftovers first (low IDs) to prove oldest-first no longer starves fresh picks.
+    seedNew(db, ['https://example.com/stale-1', 'https://example.com/stale-2']);
+    db.prepare(`UPDATE articles SET status = 'selected'`).run();
+    seedNew(db, ['https://example.com/fresh-1', 'https://example.com/fresh-2']);
+
+    // Limit 2 selects the 2 fresh articles; the writer bound is 2, all spent
+    // on the fresh picks.
+    const summary = await runDeliver(db, deps({ limit: 2 }));
+
+    expect(summary.selected).toBe(2);
+    expect(summary.write).toMatchObject({ total: 2, written: 2, failed: 0 });
+    const drafted = (
+      db.prepare('SELECT article_id FROM drafts').all() as Array<{ article_id: number }>
+    ).map((d) => d.article_id);
+    const freshIds = (
+      db
+        .prepare(`SELECT id FROM articles WHERE url LIKE '%fresh%'`)
+        .all() as Array<{ id: number }>
+    ).map((r) => r.id);
+    expect(drafted.sort((a, b) => a - b)).toEqual(freshIds.sort((a, b) => a - b));
+    const staleLeft = db
+      .prepare(`SELECT status FROM articles WHERE url LIKE '%stale%'`)
+      .all() as Array<{ status: string }>;
+    expect(staleLeft).toHaveLength(2);
+    for (const row of staleLeft) expect(row.status).toBe('selected');
+  });
+
   it('threads an object generate through the real writer: both texts land on the draft', async () => {
     const db = openTestDb();
     dbs.push(db);

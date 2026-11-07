@@ -21,6 +21,8 @@ export interface DeliverWriteFn {
       generate: (article: LlmArticle) => Promise<GenerateResult>;
       /** Cap on `selected` rows processed this run (the writer's own bound). */
       limit?: number;
+      /** Fresh-selection IDs: the writer drains these first, backfilling stale leftovers only with spare capacity. */
+      articleIds?: number[];
     },
   ): Promise<WriteSummary>;
 }
@@ -120,11 +122,18 @@ export async function runDeliver(db: Database.Database, deps: DeliverDeps): Prom
       const generate = deps.generate ?? (async () => {
         throw new Error('deliver misconfigured: no generate function and no writeFn');
       });
-      // Bound the per-run write set at the just-selected count (stale
-      // `selected` leftovers beyond it wait for a later run), on the
-      // injected clock so tests are deterministic.
+      // Pass the fresh pick explicitly: the writer drains these IDs FIRST
+      // and backfills stale `selected` leftovers only with spare capacity,
+      // so a leftover backlog can never starve what was just selected. The
+      // limit stays a hard cap on LLM calls per run. Injected clock for
+      // deterministic tests.
       const now = deps.now ?? new Date();
-      write = await writeFn(db, { now: () => now, generate, limit: select.selected.length });
+      write = await writeFn(db, {
+        now: () => now,
+        generate,
+        limit: select.selected.length,
+        articleIds: select.selected.map((a) => a.id),
+      });
     } catch (err) {
       // The write run itself cannot start (e.g. articles table unreadable):
       // record and continue — send may still deliver older pendings.
