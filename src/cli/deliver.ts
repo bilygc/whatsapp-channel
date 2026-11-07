@@ -91,11 +91,6 @@ async function main(): Promise<void> {
       generateX: apiKey
         ? (article) => generateXPost(article, { fetchFn: fetch, apiKey, model, maxTokens })
         : undefined,
-      // Same two-call shape as `npm run write`: consistency across paths
-      // matters more than the extra LLM call per article (plan cap is 4/run).
-      generateX: apiKey
-        ? (article) => generateXPost(article, { fetchFn: fetch, apiKey, model })
-        : undefined,
       fetchFn: fetch,
       token,
       chatId,
