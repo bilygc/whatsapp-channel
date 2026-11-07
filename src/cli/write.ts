@@ -7,6 +7,7 @@
  */
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
+import { logDbBriefing } from '../db/briefing.js';
 import { generateDraft, resolveLlmConfig } from '../writer/openrouter.js';
 import { runWriter } from '../writer/run.js';
 import { formatArticleLine, formatCliFailure } from './format.js';
@@ -21,9 +22,11 @@ async function main(): Promise<void> {
     return;
   }
 
-  const db = openDb(resolveDbPath());
+  const dbPath = resolveDbPath();
+  const db = openDb(dbPath);
   try {
     applyMigrations(db);
+    logDbBriefing(dbPath, db);
     console.log(`Using model: ${model}`);
     const summary = await runWriter(db, {
       now: () => new Date(),
