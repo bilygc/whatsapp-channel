@@ -39,7 +39,7 @@ async function main(): Promise<void> {
 
     let backfillExit = 0;
     if (args.backfillX) {
-      const { apiKey, model } = resolveLlmConfig();
+      const { apiKey, model, maxTokens } = resolveLlmConfig();
       if (!apiKey) {
         console.error(
           'previewDrafts failed: OPENROUTER_API_KEY is not set (see .env.example) — cannot backfill X variants.',
@@ -49,7 +49,7 @@ async function main(): Promise<void> {
       }
       console.log(`Using model: ${model}`);
       const backfill = await backfillXVariants(db, {
-        generateX: (article) => generateXPost(article, { fetchFn: fetch, apiKey, model }),
+        generateX: (article) => generateXPost(article, { fetchFn: fetch, apiKey, model, maxTokens }),
       });
       for (const r of backfill.results) {
         console.log(

@@ -10,6 +10,8 @@ export interface LlmDeps {
   model: string;
   /** Per-request timeout in ms (default LLM_TIMEOUT_MS). */
   timeoutMs?: number;
+  /** Token budget per call (default LLM_MAX_TOKENS; overridable via LLM_MAX_TOKENS env). */
+  maxTokens?: number;
   /** Max response body size in bytes (default LLM_MAX_BODY_BYTES). */
   maxBytes?: number;
   /** Backoff wait between retries (default: real setTimeout — inject a noop in tests). */
@@ -26,13 +28,19 @@ export const DEFAULT_LLM_MODEL = 'nvidia/nemotron-3.5-super-vl:free';
 export const LLM_TIMEOUT_MS = 60_000;
 
 /**
- * Token budget per caption call. Reasoning-style free-tier models (e.g. the
- * default Nemotron VL slug) emit ~400-500 tokens of English chain-of-thought
- * in `message.reasoning` BEFORE the caption: with the old 500-token budget the
- * run was cut off mid-reasoning (`content: null`, `finish_reason: length`) and
- * most articles failed. 2000 leaves room for the reasoning plus the caption.
+ * Default token budget per caption call. Reasoning-style free-tier models
+ * (e.g. the default Nemotron VL slug) emit English chain-of-thought in
+ * `message.reasoning` BEFORE the caption: with the original 500-token budget
+ * the run was cut off mid-reasoning (`content: null`, `finish_reason: length`)
+ * and most articles failed (incident 1 → raised to 2000). The model's
+ * reasoning length has since grown past that too — ~1500+ tokens of CoT
+ * observed — and every article failed the same way again (incident 2).
+ * 6000 fits ~1500+ reasoning tokens plus a full 1500-char Spanish caption
+ * (~500-800 tokens) plus hashtags with headroom. Overridable per-machine via
+ * the LLM_MAX_TOKENS env var (see resolveLlmConfig); the fail-fast
+ * no-retry-on-truncation policy is unchanged (deliberate: free-tier quota).
  */
-export const LLM_MAX_TOKENS = 2000;
+export const LLM_MAX_TOKENS = 6000;
 
 /** Captions are short — 1 MB is already generous; anything bigger is hostile. */
 export const LLM_MAX_BODY_BYTES = 1 * 1024 * 1024;
@@ -50,17 +58,24 @@ export const LLM_MAX_ATTEMPTS = LLM_RETRY_DELAYS_MS.length + 1;
 export interface LlmConfig {
   apiKey: string | undefined;
   model: string;
+  maxTokens: number;
 }
 
 /**
  * Resolve LLM config from the environment. Empty/whitespace values count as
  * unset. The model is user-overridable via LLM_MODEL; the default is the
- * free-tier Nemotron VL slug resolved at implementation time.
+ * free-tier Nemotron VL slug resolved at implementation time. The token
+ * budget is user-overridable via LLM_MAX_TOKENS; blank, non-numeric,
+ * non-integer, or non-positive values fall back to the default.
  */
 export function resolveLlmConfig(env: NodeJS.ProcessEnv = process.env): LlmConfig {
   const apiKey = env.OPENROUTER_API_KEY?.trim() || undefined;
   const model = env.LLM_MODEL?.trim() || DEFAULT_LLM_MODEL;
-  return { apiKey, model };
+  const rawMax = env.LLM_MAX_TOKENS?.trim();
+  const parsedMax = rawMax ? Number(rawMax) : NaN;
+  const maxTokens =
+    rawMax && Number.isInteger(parsedMax) && parsedMax > 0 ? parsedMax : LLM_MAX_TOKENS;
+  return { apiKey, model, maxTokens };
 }
 
 /** Strip the API key from any message — secrets never reach logs or errors. */
@@ -226,6 +241,7 @@ async function postToLlm(
 ): Promise<string> {
   const maxBytes = deps.maxBytes ?? LLM_MAX_BODY_BYTES;
   const timeoutMs = deps.timeoutMs ?? LLM_TIMEOUT_MS;
+  const maxTokens = deps.maxTokens ?? LLM_MAX_TOKENS;
   const sleep = deps.sleep ?? defaultSleep;
   const fail = (cause: string): Error => llmFail(article, deps.apiKey, cause);
 
@@ -242,7 +258,7 @@ async function postToLlm(
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      max_tokens: LLM_MAX_TOKENS,
+      max_tokens: maxTokens,
       temperature: 0.7,
     }),
     // Fresh stall budget per attempt — a reused signal could already be spent.

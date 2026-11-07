@@ -3,6 +3,7 @@ import {
   DEFAULT_LLM_MODEL,
   generateCaption,
   generateXPost,
+  LLM_MAX_TOKENS,
   LLM_TIMEOUT_MS,
   OPENROUTER_URL,
   resolveLlmConfig,
@@ -51,21 +52,42 @@ function bodyResponse(body: unknown): Response {
 
 describe('resolveLlmConfig', () => {
   it('defaults the model to the Nemotron free slug when LLM_MODEL is unset', () => {
-    expect(resolveLlmConfig({})).toEqual({ apiKey: undefined, model: DEFAULT_LLM_MODEL });
+    expect(resolveLlmConfig({})).toEqual({
+      apiKey: undefined,
+      model: DEFAULT_LLM_MODEL,
+      maxTokens: LLM_MAX_TOKENS,
+    });
     expect(DEFAULT_LLM_MODEL).toBe('nvidia/nemotron-3.5-super-vl:free');
   });
 
   it('honours LLM_MODEL and OPENROUTER_API_KEY from the environment', () => {
     expect(
       resolveLlmConfig({ OPENROUTER_API_KEY: 'k', LLM_MODEL: 'other/model:free' }),
-    ).toEqual({ apiKey: 'k', model: 'other/model:free' });
+    ).toEqual({ apiKey: 'k', model: 'other/model:free', maxTokens: LLM_MAX_TOKENS });
   });
 
   it('treats blank env values as unset', () => {
     expect(resolveLlmConfig({ OPENROUTER_API_KEY: '  ', LLM_MODEL: '' })).toEqual({
       apiKey: undefined,
       model: DEFAULT_LLM_MODEL,
+      maxTokens: LLM_MAX_TOKENS,
     });
+  });
+
+  it('defaults the token budget to 6000 (reasoning ~1500+ plus caption must fit)', () => {
+    expect(LLM_MAX_TOKENS).toBe(6000);
+    expect(resolveLlmConfig({}).maxTokens).toBe(LLM_MAX_TOKENS);
+  });
+
+  it('honours a valid LLM_MAX_TOKENS override (trims whitespace)', () => {
+    expect(resolveLlmConfig({ LLM_MAX_TOKENS: '8000' }).maxTokens).toBe(8000);
+    expect(resolveLlmConfig({ LLM_MAX_TOKENS: '  8000  ' }).maxTokens).toBe(8000);
+  });
+
+  it('falls back to the default budget on invalid LLM_MAX_TOKENS', () => {
+    for (const bad of ['abc', '', '   ', '0', '-5', '12.5', 'NaN', 'Infinity']) {
+      expect(resolveLlmConfig({ LLM_MAX_TOKENS: bad }).maxTokens).toBe(LLM_MAX_TOKENS);
+    }
   });
 });
 
@@ -244,6 +266,22 @@ describe('generateCaption', () => {
     const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string) as { max_tokens: number };
     expect(body.max_tokens).toBeGreaterThan(500);
+  });
+
+  it('ships the default budget (LLM_MAX_TOKENS) when deps.maxTokens is unset', async () => {
+    const d = deps();
+    await generateCaption(ARTICLE, d);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { max_tokens: number };
+    expect(body.max_tokens).toBe(LLM_MAX_TOKENS);
+  });
+
+  it('ships the configured budget when deps.maxTokens is set (env override path)', async () => {
+    const d = deps({ maxTokens: 1234 });
+    await generateCaption(ARTICLE, d);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { max_tokens: number };
+    expect(body.max_tokens).toBe(1234);
   });
 
   it('accepts content as an array of text parts (reasoning-model shape)', async () => {
