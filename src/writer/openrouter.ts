@@ -210,21 +210,10 @@ function defaultSleep(ms: number): Promise<void> {
 }
 
 /**
- * Typed-error constructor for the writer's LLM calls: every failure surfaces
- * as `llm write failed for article <id>: <cause>` with the key redacted —
- * callers catch per article so one failure never blocks the rest.
- */
-function llmFail(article: LlmArticle, apiKey: string, cause: string): Error {
-  return new Error(`llm write failed for article ${article.id}: ${sanitize(cause, apiKey)}`);
-}
-
-/**
- * Shared OpenRouter chat-completions core, parameterized by prompt (system +
- * pre-built user message) so the WhatsApp and X variants reuse the same
- * retry/timeout/body-cap infra instead of duplicating it. `userPrompt` must
- * already be built (and its article pre-validated) — prompt construction
- * errors belong to the wrappers below, which throw BEFORE any network call so
- * a bad row never spends LLM credits.
+ * One LLM call → raw Spanish caption for an article. Throws a typed
+ * `llm write failed for article <id>: <cause>` error — callers catch per
+ * article so one failure never blocks the rest, and the article stays
+ * `selected` for a retry. Error messages never contain the key.
  *
  * Transient failures (HTTP 429 / 5xx, dropped connections) are retried up to
  * 2 times with a short backoff — free-tier 502 blips resolve on their own and
@@ -233,17 +222,23 @@ function llmFail(article: LlmArticle, apiKey: string, cause: string): Error {
  * those only burns free-tier quota. Retries are silent (no per-attempt log
  * noise with key material) — the run summary still just reports ok/FAILED.
  */
-async function postToLlm(
-  article: LlmArticle,
-  deps: LlmDeps,
-  systemPrompt: string,
-  userPrompt: string,
-): Promise<string> {
+export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promise<string> {
   const maxBytes = deps.maxBytes ?? LLM_MAX_BODY_BYTES;
   const timeoutMs = deps.timeoutMs ?? LLM_TIMEOUT_MS;
   const maxTokens = deps.maxTokens ?? LLM_MAX_TOKENS;
   const sleep = deps.sleep ?? defaultSleep;
-  const fail = (cause: string): Error => llmFail(article, deps.apiKey, cause);
+  const fail = (cause: string): Error =>
+    new Error(`llm write failed for article ${article.id}: ${sanitize(cause, deps.apiKey)}`);
+
+  let userPrompt: string;
+  try {
+    userPrompt = buildUserPrompt(article);
+  } catch (err) {
+    // Invalid article (e.g. absurd URL): typed, and thrown BEFORE any network
+    // call so a bad row never spends LLM credits. The article stays `selected`
+    // for a later run to skip again.
+    throw fail(err instanceof Error ? err.message : String(err));
+  }
 
   const requestInit = (): RequestInit => ({
     method: 'POST',
@@ -255,7 +250,7 @@ async function postToLlm(
     body: JSON.stringify({
       model: deps.model,
       messages: [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userPrompt },
       ],
       max_tokens: maxTokens,
@@ -320,39 +315,125 @@ async function postToLlm(
 }
 
 /**
- * One LLM call → raw Spanish caption for an article. Throws a typed
- * `llm write failed for article <id>: <cause>` error — callers catch per
- * article so one failure never blocks the rest, and the article stays
- * `selected` for a retry. Error messages never contain the key.
- */
-export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promise<string> {
-  let userPrompt: string;
-  try {
-    userPrompt = buildUserPrompt(article);
-  } catch (err) {
-    // Invalid article (e.g. absurd URL): typed, and thrown BEFORE any network
-    // call so a bad row never spends LLM credits. The article stays `selected`
-    // for a later run to skip again.
-    throw llmFail(article, deps.apiKey, err instanceof Error ? err.message : String(err));
-  }
-  return postToLlm(article, deps, SYSTEM_PROMPT, userPrompt);
-}
-
-/**
- * One LLM call → raw Spanish X/Twitter post for an article. Same typed-error
- * and retry contract as generateCaption (shared postToLlm core) — callers
- * catch per article so one failure never blocks the rest, and the article
- * stays `selected` for a retry. Error messages never contain the key.
+ * One LLM call → raw Spanish X post for an article. A dedicated second call
+ * (not a two-section caption reply) so the caption path stays byte-identical
+ * and X drift can never corrupt it: callers treat an X failure as
+ * non-fatal (the draft stores with `x_post_es` NULL for a later
+ * regenerate). Same retry/sanitize/timeout contract as generateCaption —
+ * the error prefix differs (`llm xpost failed …`) so run summaries tell
+ * the two calls apart. Throws a typed
+ * `llm xpost failed for article <id>: <cause>` error; messages never
+ * contain the key.
  */
 export async function generateXPost(article: LlmArticle, deps: LlmDeps): Promise<string> {
+  const maxBytes = deps.maxBytes ?? LLM_MAX_BODY_BYTES;
+  const timeoutMs = deps.timeoutMs ?? LLM_TIMEOUT_MS;
+  const maxTokens = deps.maxTokens ?? LLM_MAX_TOKENS;
+  const sleep = deps.sleep ?? defaultSleep;
+  const fail = (cause: string): Error =>
+    new Error(`llm xpost failed for article ${article.id}: ${sanitize(cause, deps.apiKey)}`);
+
   let userPrompt: string;
   try {
     userPrompt = buildXUserPrompt(article);
   } catch (err) {
-    // Invalid article: typed, and thrown BEFORE any network call so a bad row
-    // never spends LLM credits. The article stays `selected` for a later run
-    // to skip again.
-    throw llmFail(article, deps.apiKey, err instanceof Error ? err.message : String(err));
+    // Invalid article (e.g. absurd URL): typed, and thrown BEFORE any network
+    // call so a bad row never spends LLM credits.
+    throw fail(err instanceof Error ? err.message : String(err));
   }
-  return postToLlm(article, deps, X_SYSTEM_PROMPT, userPrompt);
+
+  const requestInit = (): RequestInit => ({
+    method: 'POST',
+    redirect: 'error',
+    headers: {
+      Authorization: `Bearer ${deps.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: deps.model,
+      messages: [
+        { role: 'system', content: X_SYSTEM_PROMPT },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: maxTokens,
+      temperature: 0.7,
+    }),
+    // Fresh stall budget per attempt — a reused signal could already be spent.
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  for (let attempt = 0; ; attempt += 1) {
+    let res: Response;
+    try {
+      // The key rides in the Authorization header: never follow redirects —
+      // fail closed rather than forward the secret to an untrusted target
+      // (same convention as the NewsData fetcher).
+      res = await deps.fetchFn(OPENROUTER_URL, requestInit());
+    } catch (err) {
+      if (isRetryableFetchError(err) && attempt < LLM_RETRY_DELAYS_MS.length) {
+        await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw fail(`request failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (!res.ok) {
+      // Release the connection before throwing OR retrying; the status is all
+      // we report.
+      try {
+        await res.body?.cancel();
+      } catch {
+        // A broken body must not mask the HTTP error — ignore cancel failures.
+      }
+      if (isRetryableStatus(res.status) && attempt < LLM_RETRY_DELAYS_MS.length) {
+        await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw fail(`HTTP ${res.status}`);
+    }
+
+    let body: unknown;
+    try {
+      body = await readJsonCapped(res, maxBytes);
+    } catch (err) {
+      throw fail(err instanceof Error ? err.message : String(err));
+    }
+
+    const choice = (body as { choices?: Array<{ finish_reason?: unknown; message?: unknown }> })?.choices?.[0];
+    const raw = messageContent(choice?.message);
+    if (raw === null) {
+      if (choice?.finish_reason === 'length') {
+        throw fail('response truncated before any post text (finish_reason length)');
+      }
+      throw fail('unexpected response shape');
+    }
+    const content = stripThinkBlocks(raw);
+    if (content === '') throw fail('empty reply');
+    return content;
+  }
+}
+
+/** Raw (pre-validation) output of the two-call draft generation. */
+export interface GeneratedDraftRaw {
+  caption: string;
+  /** Null when the X call failed — the draft still stores, without an X post. */
+  xPost: string | null;
+}
+
+/**
+ * Generate both draft texts for an article: the caption call first, then the
+ * X-post call. The X call fails independently to `null` (its typed error is
+ * swallowed here — runWriter records nothing for it): a tweet failure must
+ * never fail the article or lose the caption. A caption failure still
+ * propagates (the article stays `selected` for a retry).
+ */
+export async function generateDraft(article: LlmArticle, deps: LlmDeps): Promise<GeneratedDraftRaw> {
+  const caption = await generateCaption(article, deps);
+  let xPost: string | null = null;
+  try {
+    xPost = await generateXPost(article, deps);
+  } catch {
+    xPost = null;
+  }
+  return { caption, xPost };
 }

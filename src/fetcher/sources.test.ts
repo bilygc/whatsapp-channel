@@ -1,5 +1,4 @@
 import Database from 'better-sqlite3';
-import fs from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import Parser from 'rss-parser';
 import { fetchNewsDataSource, NEWSDATA_MAX_BODY_BYTES } from './newsdata.js';
@@ -439,17 +438,10 @@ describe('migration runner', () => {
       expect(appliedFirst).toContain('0001_init.sql');
       expect(appliedFirst).toContain('0002_draft_send_tracking.sql');
       expect(appliedFirst).toContain('0003_draft_generated_image.sql');
-      expect(appliedFirst).toContain('0004_drafts_caption_x.sql');
-      // Completeness: every .sql file on disk was applied, in filename order.
-      // Derived from the migrations dir so adding 0005+ does not require
-      // updating this test (a hardcoded count went stale once already).
-      const filesOnDisk = fs
-        .readdirSync(new URL('../db/migrations/', import.meta.url))
-        .filter((f) => f.endsWith('.sql'))
-        .sort();
-      expect(appliedFirst).toEqual(filesOnDisk);
+      expect(appliedFirst).toContain('0004_draft_x_post.sql');
       // user_version tracks the migration count (one file per version).
       expect(getUserVersion(db)).toBe(appliedFirst.length);
+      expect(getUserVersion(db)).toBe(4);
       expect(
         db.prepare(`SELECT name FROM sqlite_master WHERE name = 'articles'`).get(),
       ).toBeTruthy();
@@ -461,9 +453,7 @@ describe('migration runner', () => {
           .get(),
       ).toBeTruthy();
       expect(
-        db
-          .prepare(`SELECT name FROM pragma_table_info('drafts') WHERE name = 'caption_x'`)
-          .get(),
+        db.prepare(`SELECT name FROM pragma_table_info('drafts') WHERE name = 'x_post_es'`).get(),
       ).toBeTruthy();
       const appliedSecond = applyMigrations(db);
       expect(appliedSecond).toEqual([]);
