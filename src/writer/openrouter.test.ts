@@ -4,7 +4,9 @@ import {
   generateCaption,
   generateDraft,
   generateXPost,
+  LLM_CALL_SPACING_MS,
   LLM_MAX_TOKENS,
+  LLM_RATE_LIMIT_DELAYS_MS,
   LLM_TIMEOUT_MS,
   OPENROUTER_URL,
   resolveLlmConfig,
@@ -36,6 +38,18 @@ function deps(overrides: Record<string, unknown> = {}) {
     model: DEFAULT_LLM_MODEL,
     ...overrides,
   };
+}
+
+/** Mock a non-2xx response, optionally carrying a Retry-After header value. */
+function statusResponse(status: number, retryAfter: string | null = null): Response {
+  return {
+    ok: false,
+    status,
+    headers: {
+      get: (name: string) => (name.toLowerCase() === 'retry-after' ? retryAfter : null),
+    },
+    body: { cancel: async () => {} },
+  } as unknown as Response;
 }
 
 /** Mock a 200 response with an arbitrary JSON body (reasoning-model shapes). */
@@ -212,7 +226,7 @@ describe('generateCaption', () => {
     );
   });
 
-  it('drains the unread body on HTTP errors before throwing (status-only message)', async () => {
+  it('drains the unread body on HTTP errors before throwing (exhaustion message)', async () => {
     let cancelled = false;
     const fetchFn = vi.fn(
       async () =>
@@ -224,9 +238,11 @@ describe('generateCaption', () => {
         }) as unknown as Response,
     );
     await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.toThrow(
-      /^llm write failed for article 1: HTTP 429$/,
+      /^llm write failed for article 1: HTTP 429 \(rate limited, gave up after 3 retries\)$/,
     );
     expect(cancelled).toBe(true);
+    // Persistent 429s exhaust the long rate-limit budget: 1 initial + 3 retries.
+    expect(fetchFn).toHaveBeenCalledTimes(4);
   });
 
   it('cancels the body when the declared content-length overflows (no leak)', async () => {
@@ -417,7 +433,7 @@ describe('generateCaption', () => {
     expect(sleep).toHaveBeenCalledTimes(2);
   });
 
-  it('retries 429 then succeeds', async () => {
+  it('retries 429 then succeeds (long rate-limit backoff: first wait is 2s)', async () => {
     const sleep = vi.fn(async (_ms: number) => {});
     const fetchFn = vi
       .fn()
@@ -432,6 +448,84 @@ describe('generateCaption', () => {
     );
     expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(LLM_RATE_LIMIT_DELAYS_MS[0]);
+  });
+
+  it('backs off longer on persistent 429 ([2s, 10s, 30s]) and fails typed after 3 retries', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () => statusResponse(429));
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /^llm write failed for article 1: HTTP 429 \(rate limited, gave up after 3 retries\)$/,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(4);
+    expect(sleep).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenNthCalledWith(1, 2000);
+    expect(sleep).toHaveBeenNthCalledWith(2, 10000);
+    expect(sleep).toHaveBeenNthCalledWith(3, 30000);
+    expect(LLM_RATE_LIMIT_DELAYS_MS).toEqual([2000, 10000, 30000]);
+  });
+
+  it('keeps 429 off the short 5xx schedule (first wait is 2s, not 750ms)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(statusResponse(429))
+      .mockResolvedValueOnce(
+        okResponse('🔥 caption\n\nFuente: IGN https://example.com/elden-ring-dlc'),
+      );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).resolves.toContain(
+      'caption',
+    );
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(2000);
+  });
+
+  it('honours a Retry-After response header (delay-seconds) over the schedule', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(statusResponse(429, '5'))
+      .mockResolvedValueOnce(
+        okResponse('🔥 caption\n\nFuente: IGN https://example.com/elden-ring-dlc'),
+      );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).resolves.toContain(
+      'caption',
+    );
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(5000);
+  });
+
+  it('honours an HTTP-date Retry-After header', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const retryAt = new Date(Date.now() + 45000).toUTCString();
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(statusResponse(429, retryAt))
+      .mockResolvedValueOnce(
+        okResponse('🔥 caption\n\nFuente: IGN https://example.com/elden-ring-dlc'),
+      );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).resolves.toContain(
+      'caption',
+    );
+    expect(sleep).toHaveBeenCalledTimes(1);
+    const waited = (sleep as ReturnType<typeof vi.fn>).mock.calls[0][0] as number;
+    expect(waited).toBeGreaterThan(30000);
+    expect(waited).toBeLessThanOrEqual(45000);
+  });
+
+  it('ignores an unparseable Retry-After and falls back to the schedule', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(statusResponse(429, 'not-a-delay'))
+      .mockResolvedValueOnce(
+        okResponse('🔥 caption\n\nFuente: IGN https://example.com/elden-ring-dlc'),
+      );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep }))).resolves.toContain(
+      'caption',
+    );
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(2000);
   });
 
   it('does not retry 401 (single call, no sleep)', async () => {
@@ -592,6 +686,32 @@ describe('generateXPost', () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 
+  it('backs off longer on persistent 429 and fails typed after 3 retries', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () => statusResponse(429));
+    await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /^llm xpost failed for article 1: HTTP 429 \(rate limited, gave up after 3 retries\)$/,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(4);
+    expect(sleep).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenNthCalledWith(1, 2000);
+    expect(sleep).toHaveBeenNthCalledWith(2, 10000);
+    expect(sleep).toHaveBeenNthCalledWith(3, 30000);
+  });
+
+  it('honours a Retry-After response header (delay-seconds) over the schedule', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(statusResponse(429, '5'))
+      .mockResolvedValueOnce(okResponse('¡Bombazo! #Videojuegos'));
+    await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep }))).resolves.toContain(
+      '#Videojuegos',
+    );
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(5000);
+  });
+
   it('strips <think> blocks and keeps the post outside them', async () => {
     const fetchFn = vi.fn(async () =>
       okResponse('<think>drafting in English…</think>\n¡Bombazo! #Videojuegos'),
@@ -604,24 +724,61 @@ describe('generateXPost', () => {
 
 describe('generateDraft (two-call composer)', () => {
   it('returns both raw texts from two LLM calls', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
     const fetchFn = vi
       .fn()
       .mockResolvedValueOnce(okResponse('🔥 caption larga'))
       .mockResolvedValueOnce(okResponse('¡Bombazo! #Videojuegos'));
-    const out = await generateDraft(ARTICLE, deps({ fetchFn }));
+    const out = await generateDraft(ARTICLE, deps({ fetchFn, sleep }));
     expect(out).toEqual({ caption: '🔥 caption larga', xPost: '¡Bombazo! #Videojuegos' });
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
-  it('leaves xPost NULL when the X call fails — the caption still returns intact', async () => {
+  it('spaces the caption and X-post calls (default 250ms) to spread burst traffic', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
     const fetchFn = vi
       .fn()
       .mockResolvedValueOnce(okResponse('🔥 caption larga'))
-      .mockResolvedValueOnce(
-        ({ ok: false, status: 429, headers: { get: () => null } }) as unknown as Response,
-      );
-    const out = await generateDraft(ARTICLE, deps({ fetchFn, sleep: async () => {} }));
+      .mockResolvedValueOnce(okResponse('¡Bombazo! #Videojuegos'));
+    await generateDraft(ARTICLE, deps({ fetchFn, sleep }));
+    expect(sleep).toHaveBeenCalledWith(LLM_CALL_SPACING_MS);
+    expect(LLM_CALL_SPACING_MS).toBe(250);
+  });
+
+  it('disables the spacing delay when callSpacingMs is 0', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(okResponse('🔥 caption larga'))
+      .mockResolvedValueOnce(okResponse('¡Bombazo! #Videojuegos'));
+    const out = await generateDraft(ARTICLE, deps({ fetchFn, sleep, callSpacingMs: 0 }));
+    expect(out).toEqual({ caption: '🔥 caption larga', xPost: '¡Bombazo! #Videojuegos' });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('leaves xPost NULL when the X call exhausts its 429 budget — the caption still returns intact', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(okResponse('🔥 caption larga'))
+      .mockResolvedValue(statusResponse(429));
+    const out = await generateDraft(ARTICLE, deps({ fetchFn, sleep }));
     expect(out).toEqual({ caption: '🔥 caption larga', xPost: null });
+    // 1 caption call + 1 spacing sleep + 4 X attempts (1 initial + 3 retries).
+    expect(fetchFn).toHaveBeenCalledTimes(5);
+  });
+
+  it('skips the X-post call when the caption fails with 429 (no wasted quota)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(async () => statusResponse(429));
+    await expect(generateDraft(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /^llm write failed for article 1: HTTP 429 \(rate limited, gave up after 3 retries\)$/,
+    );
+    // 1 initial caption attempt + 3 rate-limit retries; the X call never ran,
+    // so no spacing sleep either.
+    expect(fetchFn).toHaveBeenCalledTimes(4);
+    expect(sleep).toHaveBeenCalledTimes(3);
   });
 
   it('propagates a caption failure (the article stays retryable upstream)', async () => {

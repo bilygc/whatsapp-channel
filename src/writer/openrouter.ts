@@ -16,6 +16,12 @@ export interface LlmDeps {
   maxBytes?: number;
   /** Backoff wait between retries (default: real setTimeout — inject a noop in tests). */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Spacing delay between the caption and X-post calls in `generateDraft`
+   * (default LLM_CALL_SPACING_MS; 0 disables). Consulted via `deps.sleep`,
+   * so tests inject a noop like any other backoff.
+   */
+  callSpacingMs?: number;
 }
 
 /** OpenAI-compatible chat-completions endpoint (OpenRouter). */
@@ -51,6 +57,25 @@ export const LLM_MAX_BODY_BYTES = 1 * 1024 * 1024;
  * brief capacity blip, so a short backoff is enough without stalling the run).
  */
 export const LLM_RETRY_DELAYS_MS = [750, 2000];
+
+/**
+ * Backoff between RATE-LIMIT (HTTP 429) retries: ~2s then ~10s then ~30s.
+ * Free-tier 429s signal real quota pressure — each article now costs TWO LLM
+ * calls since the X-post feature landed — so the schedule is an order of
+ * magnitude longer than the 5xx blip schedule above: hammering a limited
+ * model with 750ms retries only extends the ban. A `Retry-After` response
+ * header overrides the schedule entry for that retry when parseable (see
+ * retryAfterMs). 5xxs and dropped connections stay on the short schedule.
+ */
+export const LLM_RATE_LIMIT_DELAYS_MS = [2000, 10_000, 30_000];
+
+/**
+ * Spacing delay between the caption and X-post calls in `generateDraft`:
+ * keeps the per-article burst from arriving back-to-back in the same
+ * instant. Small on purpose (a failed run is re-run manually) and
+ * overridable per call via `LlmDeps.callSpacingMs` (0 disables).
+ */
+export const LLM_CALL_SPACING_MS = 250;
 
 /** 1 initial attempt + 1 retry per backoff delay (3 attempts total). */
 export const LLM_MAX_ATTEMPTS = LLM_RETRY_DELAYS_MS.length + 1;
@@ -191,6 +216,36 @@ function isRetryableStatus(status: number): boolean {
 }
 
 /**
+ * Parse a `Retry-After` header value into milliseconds. Accepts delay-seconds
+ * (`120`, the form OpenRouter sends on free-tier 429s) and HTTP-dates;
+ * returns null when missing, unparseable, or already in the past (the caller
+ * falls back to the 429 schedule). Never throws — header values are
+ * provider-controlled.
+ */
+function parseRetryAfterMs(value: string | null | undefined): number | null {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const at = Date.parse(trimmed);
+  if (!Number.isNaN(at)) {
+    const delta = at - Date.now();
+    return delta > 0 ? delta : null;
+  }
+  return null;
+}
+
+/** Read the `Retry-After` header without letting a hostile value throw. */
+function retryAfterMs(res: Response): number | null {
+  try {
+    return parseRetryAfterMs(res.headers?.get('retry-after'));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Transient transport errors worth one more attempt: dropped connections and
  * the like. NOT retryable: `AbortSignal.timeout` exhaustion (`TimeoutError` /
  * `AbortError` — the stall budget already ran out, waiting longer burns quota
@@ -215,12 +270,15 @@ function defaultSleep(ms: number): Promise<void> {
  * article so one failure never blocks the rest, and the article stays
  * `selected` for a retry. Error messages never contain the key.
  *
- * Transient failures (HTTP 429 / 5xx, dropped connections) are retried up to
- * 2 times with a short backoff — free-tier 502 blips resolve on their own and
- * a manual re-run should not be needed. Deterministic failures (other 4xx,
- * timeouts, bad shapes, truncation, empty replies) fail immediately: retrying
- * those only burns free-tier quota. Retries are silent (no per-attempt log
- * noise with key material) — the run summary still just reports ok/FAILED.
+ * Transient failures are retried on two independent budgets: HTTP 429
+ * (rate limit) waits out the long `LLM_RATE_LIMIT_DELAYS_MS` schedule (up to
+ * 3 retries, honoring `Retry-After` when the provider sends one), while 5xx
+ * and dropped connections keep the short `LLM_RETRY_DELAYS_MS` backoff —
+ * free-tier 502 blips resolve on their own and a manual re-run should not be
+ * needed. Deterministic failures (other 4xx, timeouts, bad shapes,
+ * truncation, empty replies) fail immediately: retrying those only burns
+ * free-tier quota. Retries are silent (no per-attempt log noise with key
+ * material) — the run summary still just reports ok/FAILED.
  */
 export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promise<string> {
   const maxBytes = deps.maxBytes ?? LLM_MAX_BODY_BYTES;
@@ -260,7 +318,12 @@ export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promi
     signal: AbortSignal.timeout(timeoutMs),
   });
 
-  for (let attempt = 0; ; attempt += 1) {
+  // 429s and 5xx/transports retry on INDEPENDENT budgets: rate limiting gets
+  // the long schedule (up to 3 retries), brief 5xx blips and dropped
+  // connections keep the short one. Mixed failures consume both budgets.
+  let transientRetries = 0;
+  let rateLimitRetries = 0;
+  for (;;) {
     let res: Response;
     try {
       // The key rides in the Authorization header: never follow redirects —
@@ -268,8 +331,9 @@ export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promi
       // (same convention as the NewsData fetcher).
       res = await deps.fetchFn(OPENROUTER_URL, requestInit());
     } catch (err) {
-      if (isRetryableFetchError(err) && attempt < LLM_RETRY_DELAYS_MS.length) {
-        await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+      if (isRetryableFetchError(err) && transientRetries < LLM_RETRY_DELAYS_MS.length) {
+        await sleep(LLM_RETRY_DELAYS_MS[transientRetries]);
+        transientRetries += 1;
         continue;
       }
       throw fail(`request failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -283,8 +347,21 @@ export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promi
       } catch {
         // A broken body must not mask the HTTP error — ignore cancel failures.
       }
-      if (isRetryableStatus(res.status) && attempt < LLM_RETRY_DELAYS_MS.length) {
-        await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+      if (res.status === 429) {
+        // Rate limiting gets its own, longer budget (up to 3 retries): the
+        // provider asked us to slow down, so the short blip backoff must not
+        // apply. Mixed failures consume both budgets independently.
+        if (rateLimitRetries < LLM_RATE_LIMIT_DELAYS_MS.length) {
+          const wait = retryAfterMs(res) ?? LLM_RATE_LIMIT_DELAYS_MS[rateLimitRetries];
+          rateLimitRetries += 1;
+          await sleep(wait);
+          continue;
+        }
+        throw fail(`HTTP 429 (rate limited, gave up after ${rateLimitRetries} retries)`);
+      }
+      if (isRetryableStatus(res.status) && transientRetries < LLM_RETRY_DELAYS_MS.length) {
+        await sleep(LLM_RETRY_DELAYS_MS[transientRetries]);
+        transientRetries += 1;
         continue;
       }
       throw fail(`HTTP ${res.status}`);
@@ -320,8 +397,9 @@ export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promi
  * and X drift can never corrupt it: callers treat an X failure as
  * non-fatal (the draft stores with `x_post_es` NULL for a later
  * regenerate). Same retry/sanitize/timeout contract as generateCaption —
- * the error prefix differs (`llm xpost failed …`) so run summaries tell
- * the two calls apart. Throws a typed
+ * including the long 429 schedule with `Retry-After` honoring (up to 3
+ * retries, then a typed exhaustion error) — the error prefix differs
+ * (`llm xpost failed …`) so run summaries tell the two calls apart. Throws a typed
  * `llm xpost failed for article <id>: <cause>` error; messages never
  * contain the key.
  */
@@ -362,7 +440,12 @@ export async function generateXPost(article: LlmArticle, deps: LlmDeps): Promise
     signal: AbortSignal.timeout(timeoutMs),
   });
 
-  for (let attempt = 0; ; attempt += 1) {
+  // 429s and 5xx/transports retry on INDEPENDENT budgets: rate limiting gets
+  // the long schedule (up to 3 retries), brief 5xx blips and dropped
+  // connections keep the short one. Mixed failures consume both budgets.
+  let transientRetries = 0;
+  let rateLimitRetries = 0;
+  for (;;) {
     let res: Response;
     try {
       // The key rides in the Authorization header: never follow redirects —
@@ -370,8 +453,9 @@ export async function generateXPost(article: LlmArticle, deps: LlmDeps): Promise
       // (same convention as the NewsData fetcher).
       res = await deps.fetchFn(OPENROUTER_URL, requestInit());
     } catch (err) {
-      if (isRetryableFetchError(err) && attempt < LLM_RETRY_DELAYS_MS.length) {
-        await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+      if (isRetryableFetchError(err) && transientRetries < LLM_RETRY_DELAYS_MS.length) {
+        await sleep(LLM_RETRY_DELAYS_MS[transientRetries]);
+        transientRetries += 1;
         continue;
       }
       throw fail(`request failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -385,8 +469,21 @@ export async function generateXPost(article: LlmArticle, deps: LlmDeps): Promise
       } catch {
         // A broken body must not mask the HTTP error — ignore cancel failures.
       }
-      if (isRetryableStatus(res.status) && attempt < LLM_RETRY_DELAYS_MS.length) {
-        await sleep(LLM_RETRY_DELAYS_MS[attempt]);
+      if (res.status === 429) {
+        // Rate limiting gets its own, longer budget (up to 3 retries): the
+        // provider asked us to slow down, so the short blip backoff must not
+        // apply. Mixed failures consume both budgets independently.
+        if (rateLimitRetries < LLM_RATE_LIMIT_DELAYS_MS.length) {
+          const wait = retryAfterMs(res) ?? LLM_RATE_LIMIT_DELAYS_MS[rateLimitRetries];
+          rateLimitRetries += 1;
+          await sleep(wait);
+          continue;
+        }
+        throw fail(`HTTP 429 (rate limited, gave up after ${rateLimitRetries} retries)`);
+      }
+      if (isRetryableStatus(res.status) && transientRetries < LLM_RETRY_DELAYS_MS.length) {
+        await sleep(LLM_RETRY_DELAYS_MS[transientRetries]);
+        transientRetries += 1;
         continue;
       }
       throw fail(`HTTP ${res.status}`);
@@ -425,10 +522,18 @@ export interface GeneratedDraftRaw {
  * X-post call. The X call fails independently to `null` (its typed error is
  * swallowed here — runWriter records nothing for it): a tweet failure must
  * never fail the article or lose the caption. A caption failure still
- * propagates (the article stays `selected` for a retry).
+ * propagates (the article stays `selected` for a retry) — notably a caption
+ * 429 exhausts the long backoff and throws BEFORE the X call is attempted,
+ * so a rate-limited model never spends a second round of quota on the same
+ * article. The two calls stay sequential (no parallelism): bursty parallel
+ * calls are exactly what trips free-tier limits, and a short spacing delay
+ * (`LLM_CALL_SPACING_MS`, via `deps.callSpacingMs`) spreads the burst.
  */
 export async function generateDraft(article: LlmArticle, deps: LlmDeps): Promise<GeneratedDraftRaw> {
   const caption = await generateCaption(article, deps);
+  const sleep = deps.sleep ?? defaultSleep;
+  const spacing = deps.callSpacingMs ?? LLM_CALL_SPACING_MS;
+  if (spacing > 0) await sleep(spacing);
   let xPost: string | null = null;
   try {
     xPost = await generateXPost(article, deps);
