@@ -1,34 +1,54 @@
 #!/usr/bin/env tsx
 /**
  * `npm run previewDrafts` — M2 preview CLI: print drafts (default `pending`,
- * oldest first) with their Spanish captions AND Twitter/X variants for review
- * before M3 Telegram delivery. Usage: npm run previewDrafts [-- <pending|posted|skipped|all> [--backfill-x]]
- *   --backfill-x regenerates the X variant for pending drafts that have a
- *   WhatsApp caption but caption_x IS NULL (one LLM call per draft, without
- *   touching caption_es), then shows the preview as usual. Display and
- *   backfill only — never any auto-posting to X.
+ * oldest first) with their Spanish captions for review before M3 Telegram
+ * delivery. Usage: npm run previewDrafts [-- <pending|posted|skipped|all>]
  */
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
-import { generateXPost, resolveLlmConfig } from '../writer/openrouter.js';
-import { scrubToLine } from '../writer/validate.js';
-import {
-  backfillXVariants,
-  formatDraftPreview,
-  parsePreviewDraftsArgs,
-  type PreviewDraftsArgs,
-  type PreviewRow,
-} from '../drafts/preview.js';
+import { scrub, scrubToLine } from '../writer/validate.js';
 import { formatCliFailure } from './format.js';
 
 config();
 
+const STATUSES = ['pending', 'posted', 'skipped'] as const;
+
+export interface DraftPreviewRow {
+  id: number;
+  status: string;
+  caption_es: string;
+  /** Null when no X post has been generated for the draft yet. */
+  x_post_es: string | null;
+  created_at: string;
+  title: string;
+  source: string;
+  url: string;
+}
+
+/**
+ * Render one draft for terminal review: caption first, then the X post as
+ * its own labeled block. Pure (no I/O) so the review output is unit-tested.
+ * Feed-controlled fields are single-line scrubbed (display-only); stored
+ * caption/X bytes are scrubbed but otherwise printed verbatim.
+ */
+export function formatDraftPreview(row: DraftPreviewRow): string {
+  const lines = [
+    `=== draft ${row.id} [${row.status}] (${row.created_at}) ===`,
+    `Article: ${scrubToLine(row.title)}`,
+    `Source: ${scrubToLine(row.source)} ${scrubToLine(row.url)}`,
+    '--- caption (paste-ready) ---',
+    scrub(row.caption_es),
+    '--- X post: (ready to post) ---',
+    row.x_post_es === null ? '(no X post yet)' : scrub(row.x_post_es),
+    '',
+  ];
+  return lines.join('\n');
+}
+
 async function main(): Promise<void> {
-  let args: PreviewDraftsArgs;
-  try {
-    args = parsePreviewDraftsArgs(process.argv.slice(2));
-  } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
+  const filter = process.argv[2] ?? 'pending';
+  if (filter !== 'all' && !(STATUSES as readonly string[]).includes(filter)) {
+    console.error(`previewDrafts failed: status must be one of pending|posted|skipped|all (got "${filter}")`);
     process.exitCode = 1;
     return;
   }
@@ -36,43 +56,11 @@ async function main(): Promise<void> {
   const db = openDb(resolveDbPath());
   try {
     applyMigrations(db);
-
-    let backfillExit = 0;
-    if (args.backfillX) {
-      const { apiKey, model, maxTokens } = resolveLlmConfig();
-      if (!apiKey) {
-        console.error(
-          'previewDrafts failed: OPENROUTER_API_KEY is not set (see .env.example) — cannot backfill X variants.',
-        );
-        process.exitCode = 1;
-        return;
-      }
-      console.log(`Using model: ${model}`);
-      const backfill = await backfillXVariants(db, {
-        generateX: (article) => generateXPost(article, { fetchFn: fetch, apiKey, model, maxTokens }),
-      });
-      for (const r of backfill.results) {
-        console.log(
-          r.ok
-            ? `ok: draft ${r.draftId} -> x variant stored`
-            : `FAILED: draft ${r.draftId}: ${scrubToLine(r.error ?? '')}`,
-        );
-      }
-      if (backfill.total === 0) {
-        console.log('backfill-x: nothing to do (no pending drafts missing X variants).');
-      } else {
-        console.log(
-          `backfill-x: pending-missing=${backfill.total} filled=${backfill.filled} failed=${backfill.failed}`,
-        );
-      }
-      backfillExit = backfill.exitCode;
-    }
-
     const rows = (
-      args.filter === 'all'
+      filter === 'all'
         ? db
             .prepare(
-              `SELECT d.id, d.status, d.caption_es, d.caption_x, d.created_at,
+              `SELECT d.id, d.status, d.caption_es, d.x_post_es, d.created_at,
                       a.title, a.source, a.url
                FROM drafts d JOIN articles a ON a.id = d.article_id
                ORDER BY d.id`,
@@ -80,24 +68,21 @@ async function main(): Promise<void> {
             .all()
         : db
             .prepare(
-              `SELECT d.id, d.status, d.caption_es, d.caption_x, d.created_at,
+              `SELECT d.id, d.status, d.caption_es, d.x_post_es, d.created_at,
                       a.title, a.source, a.url
                FROM drafts d JOIN articles a ON a.id = d.article_id
                WHERE d.status = ? ORDER BY d.id`,
             )
-            .all(args.filter)
-    ) as PreviewRow[];
+            .all(filter)
+    ) as DraftPreviewRow[];
 
     if (rows.length === 0) {
-      console.log(`No ${args.filter} drafts.`);
-      process.exitCode = backfillExit;
+      console.log(`No ${filter} drafts.`);
       return;
     }
     for (const row of rows) {
       console.log(formatDraftPreview(row));
-      console.log();
     }
-    process.exitCode = backfillExit;
   } catch (err) {
     console.error(`previewDrafts failed: ${err instanceof Error ? err.message : err}`);
     process.exitCode = 1;

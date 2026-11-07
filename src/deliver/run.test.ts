@@ -277,7 +277,7 @@ describe('runDeliver (select → write → telegramSend chain)', () => {
         wdeps: { now: () => Date; generate: unknown; limit?: number },
       ): Promise<WriteSummary> => {
         seen.push({ limit: wdeps.limit, now: wdeps.now() });
-        return { results: [], total: 0, written: 0, failed: 0, xWritten: 0, exitCode: 0 };
+        return { results: [], total: 0, written: 0, failed: 0, exitCode: 0 };
       },
     );
 
@@ -313,8 +313,7 @@ describe('runDeliver (select → write → telegramSend chain)', () => {
     expect(seenLimit).toBe(12);
   });
 
-  it('caps the real writer at the selection count (integration: stale leftovers wait)', async () => {
-    const db = openTestDb();
+  it('caps the real writer at the selection count (integration: stale leftovers wait)', async () => {    const db = openTestDb();
     dbs.push(db);
     seedNew(db, ['https://example.com/fresh']);
     seedNew(db, ['https://example.com/stale']);
@@ -331,105 +330,45 @@ describe('runDeliver (select → write → telegramSend chain)', () => {
     };
     expect(stale.status).toBe('selected');
   });
-});
 
-describe('runDeliver with generateX (Twitter/X variant on the cron path)', () => {
-  let dbs: Database.Database[] = [];
-  afterEach(() => {
-    for (const db of dbs) db.close();
-    dbs = [];
-    vi.restoreAllMocks();
-  });
-
-  it('threads generateX through to the writer (same seam as `npm run write`)', async () => {
+  it('threads an object generate through the real writer: both texts land on the draft', async () => {
     const db = openTestDb();
     dbs.push(db);
     seedNew(db, ['https://example.com/a']);
-    let seen: { generateX?: unknown } | undefined;
-    const writeFn = vi.fn(
-      async (
-        _db: unknown,
-        wdeps: { now: () => Date; generate: unknown; generateX?: unknown; limit?: number },
-      ): Promise<WriteSummary> => {
-        seen = { generateX: wdeps.generateX };
-        return { results: [], total: 0, written: 0, failed: 0, xWritten: 0, exitCode: 0 };
-      },
-    );
-    const generateX = async (article: { url: string }) => `post ${article.url} #Videojuegos`;
-
-    await runDeliver(db, deps({ writeFn, generateX }));
-
-    expect(writeFn).toHaveBeenCalledOnce();
-    expect(seen?.generateX).toBe(generateX);
-  });
-
-  it('stores caption_x on the cron path via the real writer (consistency with `npm run write`)', async () => {
-    const db = openTestDb();
-    dbs.push(db);
-    seedNew(db, ['https://example.com/a', 'https://example.com/b']);
 
     const summary = await runDeliver(
       db,
       deps({
-        generateX: async (article) => `¡Notición! ${article.title} #Videojuegos ${article.url}`,
+        generate: async (article) => ({
+          caption: `🔥 ${article.title}\n\nFuente: ${article.source} ${article.url}`,
+          xPost: `¡Notición! #Videojuegos\n\nFuente: ${article.source} ${article.url}`,
+        }),
       }),
     );
 
-    expect(summary.write).toMatchObject({ total: 2, written: 2, failed: 0, xWritten: 2 });
-    const rows = db.prepare('SELECT caption_es, caption_x FROM drafts').all() as Array<{
+    expect(summary.write).toMatchObject({ total: 1, written: 1, failed: 0 });
+    const draft = db.prepare('SELECT caption_es, x_post_es FROM drafts').get() as {
       caption_es: string;
-      caption_x: string | null;
-    }>;
-    expect(rows).toHaveLength(2);
-    for (const row of rows) {
-      // toContain fails on NULL first, so the length check below is meaningful.
-      expect(row.caption_x).toContain('#Videojuegos');
-      expect((row.caption_x ?? '').length).toBeLessThanOrEqual(280);
-      // The WhatsApp caption is untouched by the X variant.
-      expect(row.caption_es).toContain('Fuente:');
-    }
+      x_post_es: string | null;
+    };
+    expect(draft.caption_es).toContain('https://example.com/a');
+    expect(draft.x_post_es).toContain('#Videojuegos');
+    expect(draft.x_post_es!.length).toBeLessThanOrEqual(280);
   });
 
-  it('isolates X failures per article on the cron path: the rest still land with both captions', async () => {
-    const db = openTestDb();
-    dbs.push(db);
-    seedNew(db, ['https://example.com/good', 'https://example.com/bad']);
-
-    const summary = await runDeliver(
-      db,
-      deps({
-        generateX: async (article) => {
-          if (article.url.endsWith('/bad')) throw new Error('llm write failed for article 2: HTTP 429');
-          return `post #Videojuegos ${article.url}`;
-        },
-      }),
-    );
-
-    expect(summary.write).toMatchObject({ total: 2, written: 1, failed: 1, xWritten: 1 });
-    // Failed article stays `selected` (retryable); its WhatsApp caption was
-    // never stored either (atomic per article — X failure corrupts nothing).
-    expect(
-      (db.prepare(`SELECT status FROM articles WHERE url = 'https://example.com/bad'`).get() as { status: string }).status,
-    ).toBe('selected');
-    const drafts = db.prepare('SELECT caption_es, caption_x FROM drafts').all() as Array<{
-      caption_es: string;
-      caption_x: string | null;
-    }>;
-    expect(drafts).toHaveLength(1);
-    expect(drafts[0].caption_es).toContain('Fuente:');
-    expect(drafts[0].caption_x).toContain('#Videojuegos');
-    expect(summary.write?.results.find((r) => !r.ok)?.error).toMatch(/429/);
-  });
-
-  it('leaves caption_x NULL when generateX is not wired (keyless cron still sends pendings)', async () => {
+  it('a legacy string generate still threads through (x_post_es stays NULL, no regression)', async () => {
     const db = openTestDb();
     dbs.push(db);
     seedNew(db, ['https://example.com/a']);
 
     const summary = await runDeliver(db, deps());
 
-    expect(summary.write).toMatchObject({ total: 1, written: 1, failed: 0, xWritten: 0 });
-    const row = db.prepare('SELECT caption_x FROM drafts').get() as { caption_x: string | null };
-    expect(row.caption_x).toBeNull();
+    expect(summary.write).toMatchObject({ total: 1, written: 1, failed: 0 });
+    const draft = db.prepare('SELECT caption_es, x_post_es FROM drafts').get() as {
+      caption_es: string;
+      x_post_es: string | null;
+    };
+    expect(draft.caption_es).toContain('https://example.com/a');
+    expect(draft.x_post_es).toBeNull();
   });
 });

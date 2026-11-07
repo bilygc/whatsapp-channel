@@ -3,15 +3,17 @@
 /** WhatsApp-caption ceiling: keep drafts paste-ready without manual trimming. */
 export const MAX_CAPTION_CHARS = 1500;
 
-/**
- * X/Twitter post ceiling: the platform limit. A write-time constraint (like
- * MAX_CAPTION_CHARS), NOT a SQL CHECK — the schema (`drafts.caption_x`)
- * deliberately stays permissive so regeneration workflows never fight the DB.
- */
-export const MAX_X_POST_CHARS = 280;
+/** X-post ceiling: a post longer than this is not ready to publish. */
+export const MAX_TWEET_CHARS = 280;
 
 export interface ValidateInput {
   caption: string;
+  source: string;
+  url: string;
+}
+
+export interface TweetInput {
+  tweet: string;
   source: string;
   url: string;
 }
@@ -190,102 +192,82 @@ export function normalizeCaption(input: ValidateInput): string {
   return `${truncated}\n\n${required}`;
 }
 
-/** Trailing hashtag run (`#tag … #tag` at the very end, X's required suffix). */
-const X_HASHTAG_RUN_RE = /(^|\s)((?:#[\p{L}\p{N}_]+)(?:\s+#[\p{L}\p{N}_]+)*)\s*$/u;
-
 /**
- * Strip the markdown the X prompt forbids (X renders plain text only):
- * `**bold**`, `# ` headings (never `#tag` — no space after `#`), and leading
- * list markers (`- `, `* `, `1. `). Single-`*`/`_` emphasis is deliberately
- * left alone: those bytes are common inside URLs and snake_case, and mangling
- * a link is worse than leaving stray asterisks.
+ * Validate + normalize a raw LLM X post before it touches the DB. Same
+ * defense-in-depth as normalizeCaption, tightened to MAX_TWEET_CHARS —
+ * except the X post carries NO attribution line:
+ * - Invisible/control characters and ANSI escapes are scrubbed first.
+ * - Model-written `Fuente:` lines are still stripped (defense in depth:
+ *   the model may emit one out of habit) and nothing is re-appended.
+ * - Body lines bearing any URL other than the true article URL are dropped.
+ * - Hashtag noise is trimmed: lone `#` tokens are dropped, exact-duplicate
+ *   hashtags (case-insensitive) keep only their first occurrence, and
+ *   whitespace runs are collapsed — all display-only hygiene, never content.
+ * - Overlong: boundary-truncated to MAX_TWEET_CHARS (never a partial-URL
+ *   fragment).
+ * - Empty output, or a body left empty after stripping, is a typed error.
+ *   Callers treat this as NON-fatal: the caption is stored anyway and
+ *   `x_post_es` stays NULL for a later regenerate.
  */
-function stripXMarkdown(text: string): string {
-  return text
-    .split('\n')
-    .map((line) =>
-      line.replace(/^\s*#{1,6}\s+/, '').replace(/^\s*(?:[-*+]|\d+[.)])\s+/, ''),
-    )
-    .join('\n')
-    .replace(/\*\*([^*]+)\*\*/g, '$1');
-}
+export function normalizeTweet(input: TweetInput): string {
+  const text = scrub(input.tweet).trim();
+  if (text === '') {
+    throw new Error('tweet validation failed: empty reply');
+  }
 
-/**
- * Cut `head` to `room` chars while pinning a trailing hashtag run: the X
- * prompt mandates 2–5 hashtags at the end, so a naive tail cut would eat the
- * most-required part first. The head is cut at a whitespace boundary via the
- * shared truncateBodyAtBoundary (no partial-URL fragments, no lone
- * surrogates); when the tags alone do not fit, fall back to a plain cut.
- */
-function truncateXHead(head: string, room: number): string {
-  if (head.length <= room) return head;
-  const m = X_HASHTAG_RUN_RE.exec(head);
-  if (!m) return truncateBodyAtBoundary(head, room);
-  const tags = m[2];
-  const need = tags.length + 1; // space separator
-  if (need >= room) return truncateBodyAtBoundary(head, room);
-  const before = head.slice(0, m.index).trimEnd();
-  const cut = truncateBodyAtBoundary(before, room - need);
-  if (cut === '') return truncateBodyAtBoundary(head, room);
-  return `${cut} ${tags}`;
-}
-
-/**
- * Validate + normalize a raw LLM X/Twitter post before it touches the DB.
- * WhatsApp rules do NOT apply here: no `Fuente:` line, no 1500-char cap —
- * the post is capped at MAX_X_POST_CHARS (hashtags included) and attribution
- * means keeping the source URL, or the source name when the URL would
- * overflow the limit (per the X prompt contract).
- *
- * Shared guarantees with normalizeCaption (same threat model, smaller budget):
- * - Invisible/control characters and ANSI escapes are scrubbed first via the
- *   shared scrub() — never duplicated.
- * - A whitespace/control-bearing article URL is rejected outright (typed
- *   invalid-article error; the article stays `selected`).
- * - Truncation always lands on a whitespace boundary (shared
- *   truncateBodyAtBoundary): no partial `https://…` fragment is ever stored,
- *   and trailing hashtags are pinned so the cut takes body copy, not tags.
- * - Empty output is a retryable typed failure.
- */
-export function normalizeXPost(input: ValidateInput): string {
-  const cleanSource = scrub(input.source).trim();
+  // Same legacy-row guard as normalizeCaption: a smuggled multi-line URL
+  // must never reach the stored post. `source` is intentionally ignored —
+  // the X post carries no attribution line, so there is nothing to fit.
   const cleanUrl = scrub(input.url).trim();
   if (cleanUrl === '' || /[\x00-\x20\x7F]/.test(input.url.trim()) || /\s/.test(cleanUrl)) {
     throw new Error('invalid article: url contains whitespace/control characters');
   }
 
-  const text = stripXMarkdown(scrub(input.caption)).trim();
-  if (text === '') {
-    throw new Error('x post validation failed: empty reply');
-  }
+  // Strip any model-written attribution lines and drop URL-bearing foreign
+  // lines; no attribution is re-appended.
+  const bodyLines = text
+    .split('\n')
+    .filter((line) => !isAttributionLine(line))
+    .filter((line) => isCleanBodyLine(line, cleanUrl));
+  const cleaned = bodyLines
+    .map((line) =>
+      line
+        .replace(/[ \t]+/g, ' ')
+        .split(' ')
+        .filter((tok) => tok !== '#')
+        .join(' '),
+    )
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 
-  if (text.includes(cleanUrl)) {
-    const cut = truncateXHead(text, MAX_X_POST_CHARS);
-    if (!cut.includes(cleanUrl) && cleanSource !== '' && !cut.includes(cleanSource)) {
-      // Truncation ate the URL whole: pin the source name so some
-      // attribution survives the cut.
-      const tag = ` (${cleanSource})`;
-      if (tag.length < MAX_X_POST_CHARS) {
-        const recut = truncateXHead(cut, MAX_X_POST_CHARS - tag.length);
-        return recut === '' ? cleanSource : `${recut}${tag}`;
-      }
-    }
-    return cut;
-  }
+  // Dedupe exact-duplicate hashtags (case-insensitive), keeping the first
+  // occurrence in place — a model echoing #Videojuegos three times is noise.
+  const seenTags = new Set<string>();
+  const body = cleaned
+    .split('\n')
+    .map((line) =>
+      line
+        .split(' ')
+        .filter((tok) => {
+          if (!/^#[^\s#]+$/u.test(tok)) return true;
+          const key = tok.toLowerCase();
+          if (seenTags.has(key)) return false;
+          seenTags.add(key);
+          return true;
+        })
+        .join(' '),
+    )
+    .join('\n')
+    .trim();
 
-  const withUrl = `${text} ${cleanUrl}`;
-  if (withUrl.length <= MAX_X_POST_CHARS) return withUrl;
-
-  // The URL would overflow the limit: the source name is the fallback
-  // attribution (per the X prompt contract).
-  if (cleanSource !== '' && !text.includes(cleanSource)) {
-    const tag = ` (${cleanSource})`;
-    if (tag.length >= MAX_X_POST_CHARS) {
-      throw new Error('x post validation failed: attribution too long');
-    }
-    const cut = truncateXHead(text, MAX_X_POST_CHARS - tag.length);
-    if (cut === '') return cleanSource;
-    return `${cut}${tag}`;
+  // Boundary cut (shared helper) to the full 280-char cap: never store a
+  // partial `https://…` fragment. A body left empty after stripping (e.g.
+  // the model replied with only a `Fuente:` line) is a typed error, not an
+  // empty post.
+  const truncated = truncateBodyAtBoundary(body, MAX_TWEET_CHARS);
+  if (truncated === '') {
+    throw new Error('tweet validation failed: empty reply');
   }
-  return truncateXHead(text, MAX_X_POST_CHARS);
+  return truncated;
 }

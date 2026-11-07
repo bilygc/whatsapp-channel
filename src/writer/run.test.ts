@@ -188,116 +188,6 @@ describe('runWriter', () => {
 
     expect(summary).toMatchObject({ total: 2, written: 2, failed: 0 });
   });
-
-  it('leaves caption_x NULL when no generateX is wired (back-compat: keyless/unwired runs)', async () => {
-    const db = openTestDb();
-    dbs.push(db);
-    seedSelected(db, [{ url: 'https://example.com/a' }]);
-
-    const summary = await runWriter(db, deps());
-
-    expect(summary).toMatchObject({ total: 1, written: 1, failed: 0, xWritten: 0 });
-    const row = db.prepare('SELECT caption_x FROM drafts').get() as { caption_x: string | null };
-    expect(row.caption_x).toBeNull();
-  });
-});
-
-describe('runWriter with generateX (Twitter/X variant)', () => {
-  let dbs: Database.Database[] = [];
-  afterEach(() => {
-    for (const db of dbs) db.close();
-    dbs = [];
-    vi.restoreAllMocks();
-  });
-
-  function depsX(overrides: Partial<WriterDeps> = {}): WriterDeps {
-    return {
-      now: () => new Date('2026-10-17T12:00:00.000Z'),
-      generate: async (article) =>
-        `🔥 ${article.title}\n\n#Videojuegos\n\nFuente: ${article.source} ${article.url}`,
-      generateX: async (article) =>
-        `¡Notición! ${article.title} #Videojuegos ${article.url}`,
-      ...overrides,
-    };
-  }
-
-  function openDb(): Database.Database {
-    const db = openTestDb();
-    dbs.push(db);
-    return db;
-  }
-
-  it('writes caption_x per article and reports xWritten in the summary', async () => {
-    const db = openDb();
-    seedSelected(db, [{ url: 'https://example.com/a' }, { url: 'https://example.com/b' }]);
-
-    const summary = await runWriter(db, depsX());
-
-    expect(summary).toMatchObject({ total: 2, written: 2, failed: 0, xWritten: 2 });
-    const rows = db.prepare('SELECT caption_es, caption_x FROM drafts').all() as Array<{
-      caption_es: string;
-      caption_x: string | null;
-    }>;
-    expect(rows).toHaveLength(2);
-    for (const row of rows) {
-      // toContain fails on NULL first, so the length check below is meaningful.
-      expect(row.caption_x).toContain('#Videojuegos');
-      expect((row.caption_x ?? '').length).toBeLessThanOrEqual(280);
-      // The WhatsApp caption is untouched by the X variant.
-      expect(row.caption_es).toContain('Fuente:');
-    }
-  });
-
-  it('normalizes the X variant (overlong post is truncated to 280, attribution kept)', async () => {
-    const db = openDb();
-    seedSelected(db, [{ url: 'https://example.com/long', source: 'Polygon' }]);
-
-    await runWriter(
-      db,
-      depsX({ generateX: async () => `${'z '.repeat(200)}#Videojuegos #EldenRing` }),
-    );
-
-    const row = db.prepare('SELECT caption_x FROM drafts').get() as { caption_x: string };
-    expect(row.caption_x.length).toBeLessThanOrEqual(280);
-    expect(row.caption_x).toContain('Polygon');
-  });
-
-  it('isolates X failures per article: failed article stays selected, no draft lost', async () => {
-    const db = openDb();
-    seedSelected(db, [{ url: 'https://example.com/good' }, { url: 'https://example.com/bad' }]);
-
-    const summary = await runWriter(
-      db,
-      depsX({
-        generateX: async (article) => {
-          if (article.url.endsWith('/bad')) throw new Error('llm write failed for article 2: HTTP 429');
-          return `post #Videojuegos ${article.url}`;
-        },
-      }),
-    );
-
-    expect(summary).toMatchObject({ total: 2, written: 1, failed: 1, xWritten: 1 });
-    // Failed article stays `selected` (retryable); its draft was never created.
-    const failed = db.prepare(`SELECT status FROM articles WHERE url = 'https://example.com/bad'`).get() as {
-      status: string;
-    };
-    expect(failed.status).toBe('selected');
-    const drafts = db.prepare('SELECT COUNT(*) AS n FROM drafts').get() as { n: number };
-    expect(drafts.n).toBe(1);
-    expect(summary.results.find((r) => !r.ok)?.error).toMatch(/429/);
-  });
-
-  it('does not process articles that are not selected', async () => {
-    const db = openDb();
-    seedSelected(db, [{ url: 'https://example.com/a' }]);
-    db.prepare(`UPDATE articles SET status = 'new' WHERE url = 'https://example.com/a'`).run();
-    const generateX = vi.fn(async (article: { url: string }) => `post ${article.url}`);
-
-    const summary = await runWriter(db, depsX({ generateX }));
-
-    expect(summary).toMatchObject({ total: 0, written: 0, xWritten: 0 });
-    expect(generateX).not.toHaveBeenCalled();
-  });
 });
 
 describe('saveDraft (dedupe / regenerate semantics)', () => {
@@ -357,42 +247,192 @@ describe('saveDraft (dedupe / regenerate semantics)', () => {
     expect(() => saveDraft(db, 9999, 'caption')).toThrow(/^draft save failed: /);
   });
 
-  it('stores caption_x and updates it on regenerate (upsert preserves status)', () => {
+  it('writes x_post_es alongside caption_es on first insert', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const [id] = seedSelected(db, [{ url: 'https://example.com/x' }]);
+
+    const draftId = saveDraft(db, id, 'caption\n\nFuente: IGN https://example.com/x', '¡Hola! #Juegos');
+
+    const row = db.prepare('SELECT caption_es, x_post_es FROM drafts WHERE id = ?').get(draftId) as {
+      caption_es: string;
+      x_post_es: string | null;
+    };
+    expect(row.caption_es).toContain('caption');
+    expect(row.x_post_es).toBe('¡Hola! #Juegos');
+  });
+
+  it('stores NULL x_post_es by default (legacy callers without an X post)', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const [id] = seedSelected(db, [{ url: 'https://example.com/x' }]);
+
+    const draftId = saveDraft(db, id, 'caption\n\nFuente: IGN https://example.com/x');
+
+    const row = db.prepare('SELECT x_post_es FROM drafts WHERE id = ?').get(draftId) as {
+      x_post_es: string | null;
+    };
+    expect(row.x_post_es).toBeNull();
+  });
+
+  it('regenerate OVERWRITES x_post_es on the same row while preserving delivery state', () => {
     const db = openTestDb();
     dbs.push(db);
     const [id] = seedSelected(db, [{ url: 'https://example.com/r' }]);
 
-    const firstId = saveDraft(
-      db,
-      id,
-      'first caption\n\nFuente: IGN https://example.com/r',
-      'first x post #Videojuegos',
+    const firstId = saveDraft(db, id, 'first caption\n\nFuente: IGN https://example.com/r', 'first tweet');
+    db.prepare(`UPDATE drafts SET status = 'posted', posted_at = '2026-10-17T13:00:00.000Z' WHERE id = ?`).run(
+      firstId,
     );
-    db.prepare(`UPDATE drafts SET status = 'posted' WHERE id = ?`).run(firstId);
     const secondId = saveDraft(
       db,
       id,
       'regenerated caption\n\nFuente: IGN https://example.com/r',
-      'regenerated x post #Videojuegos',
+      'regenerated tweet',
     );
 
     expect(secondId).toBe(firstId);
-    const row = db.prepare('SELECT caption_es, caption_x, status FROM drafts WHERE id = ?').get(
+    const row = db.prepare('SELECT caption_es, x_post_es, status FROM drafts WHERE id = ?').get(
       firstId,
-    ) as { caption_es: string; caption_x: string | null; status: string };
-    expect(row.caption_es).toBe('regenerated caption\n\nFuente: IGN https://example.com/r');
-    expect(row.caption_x).toBe('regenerated x post #Videojuegos');
+    ) as { caption_es: string; x_post_es: string | null; status: string };
+    expect(row.caption_es).toContain('regenerated caption');
+    expect(row.x_post_es).toBe('regenerated tweet');
     expect(row.status).toBe('posted');
   });
 
-  it('defaults caption_x to NULL when the caller omits it (legacy/CLI writes)', () => {
+  it('regenerate with NULL x_post_es clears a previously stored X post (overwrite mirrors caption_es)', () => {
     const db = openTestDb();
     dbs.push(db);
     const [id] = seedSelected(db, [{ url: 'https://example.com/r' }]);
 
-    saveDraft(db, id, 'caption\n\nFuente: IGN https://example.com/r');
+    const firstId = saveDraft(db, id, 'caption\n\nFuente: IGN https://example.com/r', 'old tweet');
+    const secondId = saveDraft(db, id, 'caption\n\nFuente: IGN https://example.com/r');
 
-    const row = db.prepare('SELECT caption_x FROM drafts').get() as { caption_x: string | null };
-    expect(row.caption_x).toBeNull();
+    expect(secondId).toBe(firstId);
+    const row = db.prepare('SELECT x_post_es FROM drafts WHERE id = ?').get(firstId) as {
+      x_post_es: string | null;
+    };
+    expect(row.x_post_es).toBeNull();
+  });
+});
+
+describe('runWriter with X posts', () => {
+  let dbs: Database.Database[] = [];
+  afterEach(() => {
+    for (const db of dbs) db.close();
+    dbs = [];
+    vi.restoreAllMocks();
+  });
+
+  it('stores both caption_es and x_post_es when generate returns both texts', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [{ url: 'https://example.com/a' }]);
+
+    const summary = await runWriter(
+      db,
+      deps({
+        generate: async (article) => ({
+          caption: `🔥 ${article.title}\n\nFuente: ${article.source} ${article.url}`,
+          xPost: `¡Notición! #Videojuegos`,
+        }),
+      }),
+    );
+
+    expect(summary).toMatchObject({ total: 1, written: 1, failed: 0, exitCode: 0 });
+    const row = db.prepare('SELECT caption_es, x_post_es FROM drafts').get() as {
+      caption_es: string;
+      x_post_es: string | null;
+    };
+    expect(row.caption_es).toContain('🔥');
+    expect(row.x_post_es).toContain('#Videojuegos');
+    expect(row.x_post_es!.length).toBeLessThanOrEqual(280);
+  });
+
+  it('keeps caption_es byte-identical whether generate returns a string or an object', async () => {
+    const caption = `🔥 Título gancho\n\nCuerpo con emojis 🎮 #Videojuegos\n\nFuente: IGN https://example.com/same`;
+    const xPost = `¡Notición! #Videojuegos`;
+    const dbString = openTestDb();
+    const dbObject = openTestDb();
+    dbs.push(dbString, dbObject);
+    seedSelected(dbString, [{ url: 'https://example.com/same' }]);
+    seedSelected(dbObject, [{ url: 'https://example.com/same' }]);
+
+    await runWriter(dbString, deps({ generate: async () => caption }));
+    await runWriter(dbObject, deps({ generate: async () => ({ caption, xPost }) }));
+
+    const fromString = (dbString.prepare('SELECT caption_es FROM drafts').get() as { caption_es: string })
+      .caption_es;
+    const fromObject = (dbObject.prepare('SELECT caption_es FROM drafts').get() as { caption_es: string })
+      .caption_es;
+    expect(fromObject).toBe(fromString);
+    expect(fromObject).toBe(caption);
+  });
+
+  it('a malformed X post leaves caption_es intact and x_post_es NULL (article still ok)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [{ url: 'https://example.com/a' }]);
+
+    const summary = await runWriter(
+      db,
+      deps({
+        // Empty tweet: fails tweet validation, never the article.
+        generate: async (article) => ({
+          caption: `🔥 caption\n\nFuente: ${article.source} ${article.url}`,
+          xPost: '   ',
+        }),
+      }),
+    );
+
+    expect(summary).toMatchObject({ total: 1, written: 1, failed: 0, exitCode: 0 });
+    const row = db.prepare('SELECT caption_es, x_post_es FROM drafts').get() as {
+      caption_es: string;
+      x_post_es: string | null;
+    };
+    expect(row.caption_es).toContain('https://example.com/a');
+    expect(row.x_post_es).toBeNull();
+    // The article is consumed (used): the caption succeeded.
+    const article = db.prepare(`SELECT status FROM articles`).get() as { status: string };
+    expect(article.status).toBe('used');
+  });
+
+  it('a legacy string generate stores the caption with x_post_es NULL (no regression)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [{ url: 'https://example.com/a' }]);
+
+    const summary = await runWriter(db, deps());
+
+    expect(summary).toMatchObject({ total: 1, written: 1, failed: 0 });
+    const row = db.prepare('SELECT caption_es, x_post_es FROM drafts').get() as {
+      caption_es: string;
+      x_post_es: string | null;
+    };
+    expect(row.caption_es).toContain('https://example.com/a');
+    expect(row.x_post_es).toBeNull();
+  });
+
+  it('an overlong X post is truncated to 280 chars with no attribution appended, caption untouched', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [{ url: 'https://example.com/a' }]);
+    const caption = `🔥 caption\n\nFuente: IGN https://example.com/a`;
+
+    await runWriter(
+      db,
+      deps({
+        generate: async () => ({ caption, xPost: `${'Palabra '.repeat(60)}#Videojuegos` }),
+      }),
+    );
+
+    const row = db.prepare('SELECT caption_es, x_post_es FROM drafts').get() as {
+      caption_es: string;
+      x_post_es: string | null;
+    };
+    expect(row.caption_es).toBe(caption);
+    expect(row.x_post_es!.length).toBeLessThanOrEqual(280);
+    expect(row.x_post_es).not.toContain('Fuente:');
+    expect(row.x_post_es).not.toContain('https://example.com/a');
   });
 });

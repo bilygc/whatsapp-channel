@@ -5,7 +5,7 @@ import {
   type SelectableArticle,
   type SelectResult,
 } from '../selector/select.js';
-import { runWriter, type WriteSummary } from '../writer/run.js';
+import { runWriter, type GenerateResult, type WriteSummary } from '../writer/run.js';
 import type { LlmArticle } from '../writer/openrouter.js';
 import { runTelegramSend, SEND_QUEUE_LIMIT, type SendSummary } from '../telegram/send.js';
 
@@ -18,9 +18,7 @@ export interface DeliverWriteFn {
     db: Database.Database,
     deps: {
       now: () => Date;
-      generate: (article: LlmArticle) => Promise<string>;
-      /** Second LLM call per article for the Twitter/X variant (same seam as runWriter). */
-      generateX?: (article: LlmArticle) => Promise<string>;
+      generate: (article: LlmArticle) => Promise<GenerateResult>;
       /** Cap on `selected` rows processed this run (the writer's own bound). */
       limit?: number;
     },
@@ -47,17 +45,11 @@ export interface DeliverDeps {
   /** Injected clock for deterministic tests. */
   now?: Date;
   /**
-   * One LLM call per selected article. When undefined (no OPENROUTER_API_KEY),
+   * One LLM call set per selected article. When undefined (no OPENROUTER_API_KEY),
    * the write step is skipped with a reason and the run continues to send —
    * already-pending drafts must still deliver.
    */
-  generate?: (article: LlmArticle) => Promise<string>;
-  /**
-   * Second LLM call per selected article for the Twitter/X variant (same
-   * seam `npm run write` wires). When undefined, the write step stores
-   * `caption_x = NULL` — the pre-X back-compat shape.
-   */
-  generateX?: (article: LlmArticle) => Promise<string>;
+  generate?: (article: LlmArticle) => Promise<GenerateResult>;
   fetchFn: typeof fetch;
   token: string | undefined;
   chatId: string | undefined;
@@ -130,11 +122,9 @@ export async function runDeliver(db: Database.Database, deps: DeliverDeps): Prom
       });
       // Bound the per-run write set at the just-selected count (stale
       // `selected` leftovers beyond it wait for a later run), on the
-      // injected clock so tests are deterministic. The X-variant seam rides
-      // along (undefined when keyless — the writer then stores NULL), so the
-      // cron path produces the same two-caption drafts as `npm run write`.
+      // injected clock so tests are deterministic.
       const now = deps.now ?? new Date();
-      write = await writeFn(db, { now: () => now, generate, generateX: deps.generateX, limit: select.selected.length });
+      write = await writeFn(db, { now: () => now, generate, limit: select.selected.length });
     } catch (err) {
       // The write run itself cannot start (e.g. articles table unreadable):
       // record and continue — send may still deliver older pendings.

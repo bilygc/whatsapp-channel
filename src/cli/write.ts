@@ -1,14 +1,13 @@
 #!/usr/bin/env tsx
 /**
- * `npm run write` — M2 writer CLI: one LLM call per `selected` article (+ one
- * for the Twitter/X text variant) → Spanish caption draft (`pending`) in
- * SQLite. Per-article isolation: a failed LLM call leaves that article
- * `selected` for a retry and the rest still write. Exit code is 1 only if ALL
- * attempted articles failed.
+ * `npm run write` — M2 writer CLI: one LLM call per `selected` article →
+ * Spanish caption draft (`pending`) in SQLite. Per-article isolation: a
+ * failed LLM call leaves that article `selected` for a retry and the rest
+ * still write. Exit code is 1 only if ALL attempted articles failed.
  */
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
-import { generateCaption, generateXPost, resolveLlmConfig } from '../writer/openrouter.js';
+import { generateDraft, resolveLlmConfig } from '../writer/openrouter.js';
 import { runWriter } from '../writer/run.js';
 import { formatArticleLine, formatCliFailure } from './format.js';
 
@@ -28,14 +27,13 @@ async function main(): Promise<void> {
     console.log(`Using model: ${model}`);
     const summary = await runWriter(db, {
       now: () => new Date(),
-      generate: (article) => generateCaption(article, { fetchFn: fetch, apiKey, model, maxTokens }),
-      generateX: (article) => generateXPost(article, { fetchFn: fetch, apiKey, model, maxTokens }),
+      generate: (article) => generateDraft(article, { fetchFn: fetch, apiKey, model, maxTokens }),
     });
     for (const r of summary.results) {
       console.log(formatArticleLine(r));
     }
     console.log(
-      `Total: selected=${summary.total} written=${summary.written} failed=${summary.failed} x_variants=${summary.xWritten}`,
+      `Total: selected=${summary.total} written=${summary.written} failed=${summary.failed}`,
     );
     process.exitCode = summary.exitCode;
   } catch (err) {

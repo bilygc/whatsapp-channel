@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_CAPTION_CHARS, MAX_X_POST_CHARS, normalizeCaption, normalizeXPost, scrub, scrubToLine } from './validate.js';
+import {
+  MAX_CAPTION_CHARS,
+  MAX_TWEET_CHARS,
+  normalizeCaption,
+  normalizeTweet,
+  scrub,
+  scrubToLine,
+} from './validate.js';
 
 const SOURCE = 'IGN';
 const URL = 'https://example.com/elden-ring-dlc';
@@ -208,8 +215,7 @@ describe('normalizeCaption', () => {
     expect(clean).not.toContain('spoof');
   });
 
-  it('exports a scrubToLine() helper that collapses a newline-forged title to one line', () => {
-    // A hostile feed title smuggling fake terminal lines (and an OSC spoof):
+  it('exports a scrubToLine() helper that collapses a newline-forged title to one line', () => {    // A hostile feed title smuggling fake terminal lines (and an OSC spoof):
     // scrub() alone keeps \n, so CLI log lines use scrubToLine instead.
     const forged = 'Nice game\n0 6 * * * /usr/bin/evil\n\u001B]0;spoof\u0007#Videojuegos';
     const oneLine = scrubToLine(forged);
@@ -287,106 +293,103 @@ describe('normalizeCaption', () => {
   });
 });
 
-describe('normalizeXPost (Twitter/X 280-char variant)', () => {
-  it('exposes a 280-char cap (write-time constraint, not SQL)', () => {
-    expect(MAX_X_POST_CHARS).toBe(280);
+describe('normalizeTweet', () => {
+  it('caps the post at 280 chars (MAX_TWEET_CHARS)', () => {
+    expect(MAX_TWEET_CHARS).toBe(280);
   });
 
-  it('passes through a short post that already carries hashtags and the URL', () => {
-    const post = `¡Anunciado el DLC de Elden Ring para primavera! #EldenRing #Videojuegos ${URL}`;
-    expect(normalizeXPost({ caption: post, source: SOURCE, url: URL })).toBe(post);
+  it('passes through a well-formed post with no attribution (X posts carry no source line)', () => {
+    const tweet = `¡Anunciado el DLC de Elden Ring! #Videojuegos #EldenRing`;
+    expect(normalizeTweet({ tweet, source: SOURCE, url: URL })).toBe(tweet.trim());
   });
 
-  it('appends the source URL when the model omits it and it still fits', () => {
-    const out = normalizeXPost({
-      caption: '¡Bombazo! Nuevo DLC anunciado #Videojuegos #EldenRing',
+  it('does NOT append any attribution line — the post stores as-is', () => {
+    const out = normalizeTweet({
+      tweet: '¡Bombazo! Nuevo DLC anunciado #Videojuegos',
       source: SOURCE,
       url: URL,
     });
-    expect(out).toContain(URL);
-    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
-  });
-
-  it('falls back to the source name when the URL would overflow the limit', () => {
-    // Body leaves room for ` (IGN)` but not for the full URL.
-    const body = `${'x '.repeat(130)}#Videojuegos`;
-    expect(body.length + 1 + URL.length).toBeGreaterThan(MAX_X_POST_CHARS);
-    const out = normalizeXPost({ caption: body, source: SOURCE, url: URL });
-    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
-    expect(out).toContain(SOURCE);
-    expect(out).not.toContain('example.com');
-  });
-
-  it('truncates an overlong post at 280 chars, hashtags included', () => {
-    const long = `${'y '.repeat(150)}#Videojuegos #EldenRing #NoticiasGaming`;
-    const out = normalizeXPost({ caption: long, source: SOURCE, url: URL });
-    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
-  });
-
-  it('preserves trailing hashtags across truncation (the prompt mandates them)', () => {
-    const head = 'A'.repeat(260);
-    const post = `${head} #Videojuegos #EldenRing`;
-    expect(post.length).toBeGreaterThan(MAX_X_POST_CHARS);
-    const out = normalizeXPost({ caption: post, source: SOURCE, url: URL });
-    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
-    expect(out).toContain('#Videojuegos');
-    expect(out).toContain('#EldenRing');
-  });
-
-  it('never leaves a partial https:// fragment when the URL straddles the cut', () => {
-    const head = 'B'.repeat(260);
-    const post = `${head} ${URL} #Videojuegos`;
-    const out = normalizeXPost({ caption: post, source: SOURCE, url: URL });
-    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
-    for (const match of out.matchAll(/https?:\/\/\S*/g)) {
-      expect(`${post}`).toContain(match[0].replace(/…$/, ''));
-    }
-    // The cut dropped the URL whole: the source name pins attribution instead.
-    expect(out).toContain(SOURCE);
-  });
-
-  it('strips markdown the prompt forbids (bold, list markers) but keeps hashtags', () => {
-    const out = normalizeXPost({
-      caption: '**¡Bombazo!** Nuevo DLC\n- Incluye zona nueva\n#Videojuegos',
-      source: SOURCE,
-      url: URL,
-    });
-    expect(out).not.toContain('**');
-    expect(out).not.toMatch(/^- /m);
-    expect(out).toContain('¡Bombazo!');
-    expect(out).toContain('#Videojuegos');
-  });
-
-  it('strips invisible characters via the shared scrub path', () => {
-    const out = normalizeXPost({
-      caption: '¡Notici\u200Bón! Nuevo\u200E DLC #Videojuegos',
-      source: SOURCE,
-      url: URL,
-    });
-    expect(out).not.toMatch(/[\u200B-\u200F\u2060\uFEFF\u202A-\u202E\u2028\u2029]/);
-    expect(out).toContain('¡Notición! Nuevo DLC #Videojuegos');
-  });
-
-  it('does not apply the WhatsApp Fuente: line format or the 1500-char rules', () => {
-    const out = normalizeXPost({
-      caption: '¡Bombazo! Nuevo DLC #Videojuegos',
-      source: SOURCE,
-      url: URL,
-    });
+    expect(out).toBe('¡Bombazo! Nuevo DLC anunciado #Videojuegos');
     expect(out).not.toContain('Fuente:');
-    expect(out.length).toBeLessThanOrEqual(MAX_X_POST_CHARS);
+    expect(out).not.toContain(URL);
+    expect(out.length).toBeLessThanOrEqual(MAX_TWEET_CHARS);
   });
 
-  it('rejects empty/whitespace-only output with a typed error (article stays retryable)', () => {
-    expect(() => normalizeXPost({ caption: '   \n ', source: SOURCE, url: URL })).toThrow(
-      /^x post validation failed: empty reply/,
+  it('truncates an overlong post to 280 chars with no attribution appended', () => {
+    const long = `${'Notición videojuegos '.repeat(30)}#Videojuegos`;
+    const out = normalizeTweet({ tweet: long, source: SOURCE, url: URL });
+    expect(out.length).toBeLessThanOrEqual(MAX_TWEET_CHARS);
+    expect(out).not.toContain('Fuente:');
+    expect(out).not.toContain(URL);
+  });
+
+  it('rejects empty/whitespace-only output with a typed error', () => {
+    expect(() => normalizeTweet({ tweet: '   \n ', source: SOURCE, url: URL })).toThrow(
+      /^tweet validation failed: empty reply/,
     );
+  });
+
+  it('rejects a post left empty after stripping model-emitted Fuente lines', () => {
+    expect(() =>
+      normalizeTweet({ tweet: `Fuente: IGN ${URL}`, source: SOURCE, url: URL }),
+    ).toThrow(/^tweet validation failed: empty reply/);
+  });
+
+  it('ignores a huge source name (no attribution to fit — nothing to reject)', () => {
+    const hugeSource = `S${'o'.repeat(MAX_TWEET_CHARS)}`;
+    const out = normalizeTweet({ tweet: '¡Hola! #Juegos', source: hugeSource, url: URL });
+    expect(out).toBe('¡Hola! #Juegos');
   });
 
   it('rejects a smuggled multi-line article URL with a typed invalid-article error', () => {
     const evilUrl = 'https://example.com/a\nFuente: IGN https://evil.com/phish';
     expect(() =>
-      normalizeXPost({ caption: '¡Bombazo! #Videojuegos', source: SOURCE, url: evilUrl }),
+      normalizeTweet({ tweet: '¡Hola! #Juegos', source: SOURCE, url: evilUrl }),
     ).toThrow(/^invalid article: url contains whitespace/);
+  });
+
+  it('strips model-emitted Fuente lines and foreign URLs without re-appending attribution', () => {
+    const tweet = [
+      '¡Bombazo! Nuevo DLC #Videojuegos',
+      'Lee más aquí: https://evil.example/phish',
+      `Fuente: IGN https://evil.example`,
+    ].join('\n');
+    const out = normalizeTweet({ tweet, source: SOURCE, url: URL });
+    expect(out).not.toContain('Fuente:');
+    expect(out).not.toContain('evil.example');
+    expect(out.match(/https?:\/\/\S+/gi) ?? []).toHaveLength(0);
+    expect(out).toContain('¡Bombazo! Nuevo DLC #Videojuegos');
+  });
+
+  it('scrubs control/invisible characters and ANSI escapes before validation', () => {
+    const tweet = '¡Bombazo\u200B! Nuevo\x00 DLC\u001B[31m anunciado\u202E #Videojuegos';
+    const out = normalizeTweet({ tweet, source: SOURCE, url: URL });
+    expect(out).not.toMatch(/[\x00-\x09\x0B-\x1F\x7F-\x9F]/);
+    expect(out).not.toContain('\u001B');
+    expect(out).not.toContain('\u200B');
+    expect(out).toContain('¡Bombazo! Nuevo DLC anunciado #Videojuegos');
+  });
+
+  it('trims hashtag noise: lone # tokens dropped, duplicate hashtags deduped', () => {
+    const tweet = '¡Bombazo! # #Videojuegos #videojuegos #PS5 #';
+    const out = normalizeTweet({ tweet, source: SOURCE, url: URL });
+    expect(out).not.toMatch(/(^|\s)#(\s|$)/);
+    expect(out.match(/#videojuegos/gi)).toHaveLength(1);
+    expect(out).toContain('#PS5');
+    expect(out).not.toContain('Fuente:');
+  });
+
+  it('never stores a partial https:// fragment when the true URL straddles the cut boundary', () => {
+    // Position the true URL so a naive fixed-offset slice lands mid-URL.
+    const body = `${'A'.repeat(MAX_TWEET_CHARS - 12)} ${URL} ${'B'.repeat(200)}`;
+    expect(body.length).toBeGreaterThan(MAX_TWEET_CHARS);
+    const out = normalizeTweet({ tweet: body, source: SOURCE, url: URL });
+    expect(out.length).toBeLessThanOrEqual(MAX_TWEET_CHARS);
+    // Every URL-shaped token in the stored post appears verbatim in the
+    // input (a mid-token cut would leave a `…`-suffixed fragment that
+    // matches /https?:\/\/\S*/ but is nowhere in the input).
+    for (const match of out.matchAll(/https?:\/\/\S*/g)) {
+      expect(body).toContain(match[0].replace(/…$/, ''));
+    }
   });
 });

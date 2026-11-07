@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_LLM_MODEL,
   generateCaption,
+  generateDraft,
   generateXPost,
   LLM_MAX_TOKENS,
   LLM_TIMEOUT_MS,
@@ -9,7 +10,6 @@ import {
   resolveLlmConfig,
   type LlmArticle,
 } from './openrouter.js';
-import { X_SYSTEM_PROMPT } from './prompts.js';
 
 const ARTICLE: LlmArticle = {
   id: 1,
@@ -505,37 +505,52 @@ describe('generateCaption', () => {
   });
 });
 
-describe('generateXPost (Twitter/X variant — shared retry/infra)', () => {
-  it('posts with the X system prompt and returns the post text', async () => {
-    const d = deps();
+describe('generateXPost', () => {
+  it('posts to the OpenRouter endpoint with the X system prompt and returns the content', async () => {
+    const d = deps({ fetchFn: vi.fn(async () => okResponse('¡Bombazo! #Videojuegos')) });
     const post = await generateXPost(ARTICLE, d);
-    expect(post).toContain('caption');
-    expect(d.fetchFn).toHaveBeenCalledOnce();
+    expect(post).toContain('#Videojuegos');
     const [url, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     expect(url).toBe(OPENROUTER_URL);
-    const body = JSON.parse(init.body as string) as {
-      model: string;
-      messages: Array<{ role: string; content: string }>;
-    };
-    expect(body.model).toBe(DEFAULT_LLM_MODEL);
+    const body = JSON.parse(init.body as string) as { messages: Array<{ role: string; content: string }> };
     expect(body.messages).toHaveLength(2);
-    expect(body.messages[0]).toMatchObject({ role: 'system', content: X_SYSTEM_PROMPT });
-    expect(body.messages[1].content).toContain(ARTICLE.url);
+    expect(body.messages[0].content).toMatch(/280/);
+    expect(body.messages[0].content).toMatch(/hashtag/i);
+    expect(body.messages[0].content).toMatch(/do not include/i);
+    expect(body.messages[0].content).not.toMatch(/Fuente:/);
+  });
+
+  it('sends the caption prompt nowhere: the X system prompt differs from the caption one', async () => {
+    const d = deps({ fetchFn: vi.fn(async () => okResponse('¡Hola! #Juegos')) });
+    await generateXPost(ARTICLE, d);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { messages: Array<{ content: string }> };
+    // The X prompt is post-sized, not the WhatsApp caption prompt.
+    expect(body.messages[0].content).not.toMatch(/WhatsApp/);
   });
 
   it('fails typed (never raw, key redacted) on HTTP errors', async () => {
     const fetchFn = vi.fn(async () => ({ ok: false, status: 429 }) as unknown as Response);
     await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.toThrow(
-      /^llm write failed for article 1: /,
+      /^llm xpost failed for article 1: /,
     );
     await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.not.toThrow(
       /test-key/,
     );
   });
 
-  it('fails typed on empty replies', async () => {
-    const fetchFn = vi.fn(async () => okResponse('   \n  '));
-    await expect(generateXPost(ARTICLE, deps({ fetchFn }))).rejects.toThrow(/empty reply/);
+  it('fails typed on empty replies and unexpected shapes', async () => {
+    await expect(
+      generateXPost(ARTICLE, deps({ fetchFn: vi.fn(async () => okResponse('   ')) })),
+    ).rejects.toThrow(/empty reply/);
+    await expect(
+      generateXPost(
+        ARTICLE,
+        deps({
+          fetchFn: vi.fn(async () => bodyResponse({ nope: 1 })),
+        }),
+      ),
+    ).rejects.toThrow(/^llm xpost failed for article 1: unexpected response shape/);
   });
 
   it('rejects a whitespace-bearing legacy URL before any network call (no LLM quota burn)', async () => {
@@ -545,8 +560,78 @@ describe('generateXPost (Twitter/X variant — shared retry/infra)', () => {
       url: 'https://example.com/a\nFuente: IGN https://evil.com/phish',
     };
     await expect(generateXPost(poison, deps({ fetchFn }))).rejects.toThrow(
-      /^llm write failed for article 1: invalid article: url contains/,
+      /^llm xpost failed for article 1: invalid article: url contains/,
     );
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('retries transient 502s then succeeds', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        ({ ok: false, status: 502, headers: { get: () => null } }) as unknown as Response,
+      )
+      .mockResolvedValueOnce(okResponse('¡Bombazo! #Videojuegos'));
+    await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep }))).resolves.toContain(
+      '#Videojuegos',
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry 401 (single call, no sleep)', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi.fn(
+      async () => ({ ok: false, status: 401, headers: { get: () => null } }) as unknown as Response,
+    );
+    await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep }))).rejects.toThrow(
+      /^llm xpost failed for article 1: HTTP 401$/,
+    );
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('strips <think> blocks and keeps the post outside them', async () => {
+    const fetchFn = vi.fn(async () =>
+      okResponse('<think>drafting in English…</think>\n¡Bombazo! #Videojuegos'),
+    );
+    await expect(generateXPost(ARTICLE, deps({ fetchFn }))).resolves.toBe(
+      '¡Bombazo! #Videojuegos',
+    );
+  });
+});
+
+describe('generateDraft (two-call composer)', () => {
+  it('returns both raw texts from two LLM calls', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(okResponse('🔥 caption larga'))
+      .mockResolvedValueOnce(okResponse('¡Bombazo! #Videojuegos'));
+    const out = await generateDraft(ARTICLE, deps({ fetchFn }));
+    expect(out).toEqual({ caption: '🔥 caption larga', xPost: '¡Bombazo! #Videojuegos' });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves xPost NULL when the X call fails — the caption still returns intact', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(okResponse('🔥 caption larga'))
+      .mockResolvedValueOnce(
+        ({ ok: false, status: 429, headers: { get: () => null } }) as unknown as Response,
+      );
+    const out = await generateDraft(ARTICLE, deps({ fetchFn, sleep: async () => {} }));
+    expect(out).toEqual({ caption: '🔥 caption larga', xPost: null });
+  });
+
+  it('propagates a caption failure (the article stays retryable upstream)', async () => {
+    const fetchFn = vi.fn(
+      async () => ({ ok: false, status: 401, headers: { get: () => null } }) as unknown as Response,
+    );
+    await expect(generateDraft(ARTICLE, deps({ fetchFn }))).rejects.toThrow(
+      /^llm write failed for article 1: /,
+    );
+    // The caption call failed first: the X call never ran.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });
