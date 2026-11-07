@@ -15,6 +15,7 @@ import { config } from 'dotenv';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
+import { logDbBriefing } from '../db/briefing.js';
 import { generateDraft, resolveLlmConfig } from '../writer/openrouter.js';
 import { resolveTelegramConfig } from '../telegram/config.js';
 import { SELECT_DEFAULT_LIMIT } from '../selector/select.js';
@@ -48,7 +49,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const db = openDb(resolveDbPath());
+  const dbPath = resolveDbPath();
+  const db = openDb(dbPath);
   // Single-instance claim FIRST (fail fast): a second deliver starting
   // while one is mid-flight exits typed instead of double-sending. The
   // guard is a dedicated SQLite file, so the held claim never blocks fetch.

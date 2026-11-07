@@ -15,6 +15,7 @@
 import type Database from 'better-sqlite3';
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
+import { logDbBriefing } from '../db/briefing.js';
 import { resolveTelegramConfig } from '../telegram/config.js';
 import { runTelegramSend } from '../telegram/send.js';
 import { formatCliFailure, formatDraftSendLine } from './format.js';
@@ -110,7 +111,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const db = openDb(resolveDbPath());
+  const dbPath = resolveDbPath();
+  const db = openDb(dbPath);
   try {
     applyMigrations(db);
     if (args.resend) {
