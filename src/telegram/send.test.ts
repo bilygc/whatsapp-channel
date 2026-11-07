@@ -21,6 +21,7 @@ function seedDraft(
     imageUrl?: string | null;
     source?: string;
     url?: string;
+    xPostEs?: string | null;
   } = {},
 ): number {
   const url = opts.url ?? `https://example.com/${Math.random().toString(36).slice(2)}`;
@@ -37,7 +38,7 @@ function seedDraft(
         imageUrl: opts.imageUrl ?? null,
       }).lastInsertRowid,
   );
-  return Number(
+  const draftId = Number(
     db
       .prepare(`INSERT INTO drafts (article_id, caption_es, status) VALUES (?, ?, ?)`)
       .run(
@@ -46,6 +47,10 @@ function seedDraft(
         opts.status ?? 'pending',
       ).lastInsertRowid,
   );
+  if (opts.xPostEs !== undefined) {
+    db.prepare(`UPDATE drafts SET x_post_es = ? WHERE id = ?`).run(opts.xPostEs, draftId);
+  }
+  return draftId;
 }
 
 function okMessage(messageId = 7): Response {
@@ -236,6 +241,7 @@ describe('runTelegramSend', () => {
     const db = openTestDb();
     dbs.push(db);
     const draftId = seedDraft(db, {
+      imageUrl: 'https://img.example/x.jpg',
       caption: `body\n\nFuente: IGN https://example.com/${'x'.repeat(2000)}`,
     });
     const d = deps();
@@ -498,5 +504,92 @@ describe('runTelegramSend', () => {
     await expect(runTelegramSend(db, deps({ limit: 1.5 }))).rejects.toThrow(
       /^telegram send failed: limit must be a non-negative integer/,
     );
+  });
+
+  it('includes the X post section after the WhatsApp caption in the same message', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const caption = '🔥 Noticia\n\nFuente: IGN https://example.com/a';
+    const xPost = '🎮 ¡Notición de hoy! #Gaming #Videojuegos';
+    seedDraft(db, { caption, xPostEs: xPost });
+    const d = deps();
+
+    const summary = await runTelegramSend(db, d);
+
+    expect(summary).toMatchObject({ total: 1, sent: 1, failed: 0 });
+    const calls = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls as Array<[string, RequestInit]>;
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toMatch(/\/sendMessage$/);
+    const body = JSON.parse(calls[0][1].body as string) as Record<string, unknown>;
+    const text = body.text as string;
+    expect(text.startsWith(caption)).toBe(true);
+    expect(text).toContain(`\n\n𝕏 Post para X:\n${xPost}`);
+    expect(summary.results[0].truncated).toBeFalsy();
+  });
+
+  it('omits the X section when x_post_es is NULL (message identical to today)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const caption = '🔥 Noticia\n\nFuente: IGN https://example.com/a';
+    seedDraft(db, { caption });
+    const d = deps();
+
+    const summary = await runTelegramSend(db, d);
+
+    expect(summary).toMatchObject({ total: 1, sent: 1, failed: 0 });
+    const calls = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls as Array<[string, RequestInit]>;
+    const body = JSON.parse(calls[0][1].body as string) as Record<string, unknown>;
+    expect(body.text).toBe(caption);
+  });
+
+  it('photo path: overlong caption + X post keeps the full X section and truncates the caption to fit 1024', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const attribution = 'Fuente: IGN https://example.com/a';
+    const xPost = '🎮 ¡Notición! #Gaming';
+    // Caption alone fits 1024, but caption + X section does not.
+    const caption = `${'Palabra '.repeat(120).trim()}\n\n${attribution}`;
+    expect(caption.length).toBeLessThanOrEqual(1024);
+    expect(caption.length + `\n\n𝕏 Post para X:\n${xPost}`.length).toBeGreaterThan(1024);
+    seedDraft(db, { caption, imageUrl: 'https://img.example/x.jpg', xPostEs: xPost });
+    const d = deps();
+
+    const summary = await runTelegramSend(db, d);
+
+    expect(summary).toMatchObject({ total: 1, sent: 1, failed: 0 });
+    expect(summary.results[0].truncated).toBe(true);
+    const calls = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls as Array<[string, RequestInit]>;
+    expect(calls[0][0]).toMatch(/\/sendPhoto$/);
+    const photoBody = JSON.parse(calls[0][1].body as string) as Record<string, unknown>;
+    const sentCaption = photoBody.caption as string;
+    expect(sentCaption.length).toBeLessThanOrEqual(1024);
+    // The full X post survives (never truncated mid-tweet); the WhatsApp
+    // caption above it was cut instead.
+    expect(sentCaption.endsWith(`\n\n𝕏 Post para X:\n${xPost}`)).toBe(true);
+    expect(sentCaption).toContain(attribution);
+    expect(sentCaption).toContain('…');
+  });
+
+  it('text path: overlong caption + X post truncates the caption within the 4096 message limit', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const attribution = 'Fuente: IGN https://example.com/a';
+    const xPost = '🎮 ¡Notición! #Gaming';
+    const caption = `${'Palabra '.repeat(550).trim()}\n\n${attribution}`;
+    expect(caption.length).toBeGreaterThan(4096);
+    seedDraft(db, { caption, xPostEs: xPost });
+    const d = deps();
+
+    const summary = await runTelegramSend(db, d);
+
+    expect(summary).toMatchObject({ total: 1, sent: 1, failed: 0 });
+    expect(summary.results[0].truncated).toBe(true);
+    const calls = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls as Array<[string, RequestInit]>;
+    expect(calls[0][0]).toMatch(/\/sendMessage$/);
+    const body = JSON.parse(calls[0][1].body as string) as Record<string, unknown>;
+    const text = body.text as string;
+    expect(text.length).toBeLessThanOrEqual(4096);
+    expect(text.endsWith(`\n\n𝕏 Post para X:\n${xPost}`)).toBe(true);
+    expect(text).toContain(attribution);
   });
 });

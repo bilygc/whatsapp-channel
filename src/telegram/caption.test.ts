@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { MAX_CAPTION_CHARS } from '../writer/validate.js';
-import { TELEGRAM_CAPTION_LIMIT, fitCaptionForTelegram } from './caption.js';
+import {
+  buildTelegramMessage,
+  TELEGRAM_CAPTION_LIMIT,
+  fitCaptionForTelegram,
+  TELEGRAM_MESSAGE_LIMIT,
+  X_POST_SECTION_LABEL,
+} from './caption.js';
 
 describe('telegram caption limit', () => {
   it('sits above the writer cap, so writer drafts always fit untouched', () => {
@@ -100,5 +106,50 @@ describe('telegram caption limit', () => {
     expect(fit.caption).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
     expect(fit.caption).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
     expect(fit.caption.endsWith(attribution)).toBe(true);
+  });
+});
+
+describe('telegram message with X post section', () => {
+  it('appends the labeled X section after the caption when both fit', () => {
+    const caption = '🔥 Hola\n\nFuente: IGN https://example.com/a';
+    const xPost = '🎮 ¡Hola! #Gaming';
+    const msg = buildTelegramMessage(caption, xPost);
+    expect(msg.ok).toBe(true);
+    if (!msg.ok) return;
+    expect(msg.truncated).toBe(false);
+    expect(msg.caption).toBe(`${caption}\n\n${X_POST_SECTION_LABEL}\n${xPost}`);
+  });
+
+  it('omits the section for NULL, empty, or whitespace-only X posts', () => {
+    const caption = '🔥 Hola\n\nFuente: IGN https://example.com/a';
+    for (const x of [null, undefined, '', '   ']) {
+      const msg = buildTelegramMessage(caption, x);
+      expect(msg).toEqual(fitCaptionForTelegram(caption));
+    }
+  });
+
+  it('over budget: truncates the WhatsApp caption and keeps the full X post', () => {
+    const attribution = 'Fuente: IGN https://example.com/a';
+    const xPost = '🎮 ¡Notición! #Gaming';
+    const caption = `${'Palabra '.repeat(130).trim()}\n\n${attribution}`;
+    const msg = buildTelegramMessage(caption, xPost, 1024);
+    expect(msg.ok).toBe(true);
+    if (!msg.ok) return;
+    expect(msg.truncated).toBe(true);
+    expect(msg.caption.length).toBeLessThanOrEqual(1024);
+    expect(msg.caption.endsWith(`\n\n${X_POST_SECTION_LABEL}\n${xPost}`)).toBe(true);
+    expect(msg.caption).toContain(attribution);
+  });
+
+  it('over budget with no attribution: typed skip, never a linkless send', () => {
+    const msg = buildTelegramMessage('B'.repeat(1500), '🎮 ¡Hola! #Gaming', 1024);
+    expect(msg.ok).toBe(false);
+    if (msg.ok) return;
+    expect(msg.error).toMatch(/attribution/);
+  });
+
+  it('exposes the 4096 text-message limit alongside the 1024 photo-caption limit', () => {
+    expect(TELEGRAM_MESSAGE_LIMIT).toBe(4096);
+    expect(TELEGRAM_CAPTION_LIMIT).toBe(1024);
   });
 });

@@ -5,12 +5,18 @@ import {
   sendPhoto,
   type TelegramDeps,
 } from './api.js';
-import { TELEGRAM_CAPTION_LIMIT, fitCaptionForTelegram } from './caption.js';
+import {
+  buildTelegramMessage,
+  TELEGRAM_CAPTION_LIMIT,
+  TELEGRAM_MESSAGE_LIMIT,
+} from './caption.js';
 import { SELECT_DEFAULT_LIMIT } from '../selector/select.js';
 
 export interface PendingDraftRow {
   id: number;
   caption_es: string;
+  /** Nullable: NULL when the dedicated X LLM call failed — section omitted. */
+  x_post_es: string | null;
   source: string;
   url: string;
   image_url: string | null;
@@ -128,7 +134,8 @@ async function sendWithRateLimitRetry<T>(
 /**
  * Send every unsent `pending` draft to the configured chat: the article image
  * (by URL — Telegram fetches it server-side) plus the ready-to-paste Spanish
- * caption and posted/skipped inline buttons.
+ * caption with the X post under its labeled section, and posted/skipped
+ * inline buttons.
  *
  * Send-once semantics (migration 0002): the queue is
  * `status = 'pending' AND last_sent_at IS NULL`, bounded per run by
@@ -155,7 +162,7 @@ export async function runTelegramSend(db: Database.Database, deps: SendDeps): Pr
   try {
     rows = db
       .prepare(
-        `SELECT d.id, d.caption_es, a.source, a.url, a.image_url, a.title
+        `SELECT d.id, d.caption_es, d.x_post_es, a.source, a.url, a.image_url, a.title
          FROM drafts d JOIN articles a ON a.id = d.article_id
          WHERE d.status = 'pending' AND d.last_sent_at IS NULL ORDER BY d.id LIMIT ?`,
       )
@@ -210,7 +217,11 @@ async function sendOneDraft(
   const fail = (cause: string): Error =>
     new Error(`telegram send failed for draft ${row.id}: ${cause}`);
 
-  const fit = fitCaptionForTelegram(row.caption_es, TELEGRAM_CAPTION_LIMIT);
+  // Applicable limit: photo captions are capped at 1024, plain text
+  // messages at 4096. The photo→text fallback reuses the photo-fitted text,
+  // which always fits the larger text budget too.
+  const limit = row.image_url ? TELEGRAM_CAPTION_LIMIT : TELEGRAM_MESSAGE_LIMIT;
+  const fit = buildTelegramMessage(row.caption_es, row.x_post_es, limit);
   if (!fit.ok) throw fail(fit.error);
   const text = fit.caption;
   const replyMarkup = buildKeyboard(row.id);

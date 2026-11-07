@@ -1,11 +1,13 @@
 /**
  * Telegram caption-length guard.
  *
- * Telegram caps photo captions at 1024 chars (message text allows 4096, but
- * the cap is applied uniformly so the photo and text paths behave
- * identically). The writer cap (`MAX_CAPTION_CHARS = 1000` in
- * `src/writer/validate.ts`) already sits under it, so the truncation path
- * below only ever fires for legacy drafts written before the writer cap.
+ * Telegram caps photo captions at 1024 chars; plain text messages allow
+ * 4096. The photo path fits to `TELEGRAM_CAPTION_LIMIT`, the text path to
+ * `TELEGRAM_MESSAGE_LIMIT` (the photo→text fallback keeps its photo-fitted
+ * text, which always fits the larger text budget too). The writer cap
+ * (`MAX_CAPTION_CHARS` in `src/writer/validate.ts`) may sit above the photo
+ * cap, so the truncation path below fires for drafts the writer produced —
+ * not just legacy rows.
  *
  * Truncation shares `normalizeCaption()`'s rule (same helper, imported
  * from `src/writer/validate.ts`): the body is cut and the
@@ -24,6 +26,15 @@
 import { truncateBodyAtBoundary } from '../writer/validate.js';
 
 export const TELEGRAM_CAPTION_LIMIT = 1024;
+
+/** Plain text messages (no photo) allow up to 4096 chars. */
+export const TELEGRAM_MESSAGE_LIMIT = 4096;
+
+/**
+ * Labeled section separating the X/Twitter post from the WhatsApp caption
+ * in the same Telegram message (Spanish, plaintext — no parse_mode).
+ */
+export const X_POST_SECTION_LABEL = '𝕏 Post para X:';
 
 export type FitCaptionResult =
   | { ok: true; caption: string; truncated: boolean }
@@ -88,4 +99,46 @@ export function fitCaptionForTelegram(
   const truncated = truncateBodyAtBoundary(body, room);
   if (truncated === '') return { ok: true, caption: attribution, truncated: true };
   return { ok: true, caption: `${truncated}\n\n${attribution}`, truncated: true };
+}
+
+/**
+ * Build the per-draft Telegram message: the WhatsApp caption first, then the
+ * X/Twitter post under a labeled section — same message, so the operator
+ * copy-pastes (or forwards) both from one place.
+ *
+ * Limit rule: the COMBINED text must fit `limit` (photo or text budget,
+ * chosen by the caller). When it fits, both ship verbatim. When it does
+ * NOT fit, the X post is NEVER truncated mid-tweet — it is short by design
+ * (≤280 chars) — so the WhatsApp caption is shrunk into the remaining
+ * budget instead (`limit - section.length`, via `fitCaptionForTelegram`,
+ * which keeps the `Fuente:` attribution intact). A remainder too small for
+ * the attribution (or an X section that alone exceeds the limit) is a typed
+ * skip, like any other overlong caption: the draft stays `pending`.
+ *
+ * A NULL/empty/whitespace-only X post (the dedicated X LLM call failed)
+ * omits the section entirely — the message is exactly `fitCaptionForTelegram`.
+ */
+export function buildTelegramMessage(
+  rawCaption: string,
+  xPost: string | null | undefined,
+  limit: number = TELEGRAM_CAPTION_LIMIT,
+): FitCaptionResult {
+  const x = (xPost ?? '').trim();
+  if (x === '') return fitCaptionForTelegram(rawCaption, limit);
+  const section = `\n\n${X_POST_SECTION_LABEL}\n${x}`;
+  if (section.length >= limit) {
+    return {
+      ok: false,
+      error:
+        `message too long for telegram (X section alone is ${section.length} chars, ` +
+        `limit ${limit} — draft left pending for human review)`,
+    };
+  }
+  const caption = rawCaption.trim();
+  if (caption.length + section.length <= limit) {
+    return { ok: true, caption: `${caption}${section}`, truncated: false };
+  }
+  const fit = fitCaptionForTelegram(rawCaption, limit - section.length);
+  if (!fit.ok) return fit;
+  return { ok: true, caption: `${fit.caption}${section}`, truncated: true };
 }
