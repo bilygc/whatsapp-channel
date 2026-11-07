@@ -9,11 +9,25 @@ import {
 } from './caption.js';
 
 describe('telegram caption limit', () => {
-  it('sits above the writer cap, so writer drafts always fit untouched', () => {
-    expect(MAX_CAPTION_CHARS).toBeLessThanOrEqual(TELEGRAM_CAPTION_LIMIT);
-    const body = `🔥 Noticia\n\n${'x'.repeat(900)}\n\nFuente: IGN https://example.com/a`;
-    const fit = fitCaptionForTelegram(body.slice(0, MAX_CAPTION_CHARS));
-    expect(fit.ok && !fit.truncated).toBe(true);
+  it('sits between the photo and text limits: writer drafts fit the text path untouched, photo path truncates', () => {
+    // Writer cap (1500) exceeds the photo-caption limit (1024) but fits
+    // inside the text-message limit (4096): a max-size writer draft passes
+    // the text path through untouched, while the photo path truncates the
+    // body and keeps the Fuente: attribution intact.
+    expect(MAX_CAPTION_CHARS).toBeGreaterThan(TELEGRAM_CAPTION_LIMIT);
+    expect(MAX_CAPTION_CHARS).toBeLessThanOrEqual(TELEGRAM_MESSAGE_LIMIT);
+    const attribution = 'Fuente: IGN https://example.com/a';
+    const draft = `${'Palabra '.repeat(180).trim()}\n\n${attribution}`;
+    expect(draft.length).toBeGreaterThan(TELEGRAM_CAPTION_LIMIT);
+    expect(draft.length).toBeLessThanOrEqual(TELEGRAM_MESSAGE_LIMIT);
+    const textFit = fitCaptionForTelegram(draft, TELEGRAM_MESSAGE_LIMIT);
+    expect(textFit.ok && !textFit.truncated).toBe(true);
+    const photoFit = fitCaptionForTelegram(draft);
+    expect(photoFit.ok).toBe(true);
+    if (!photoFit.ok) return;
+    expect(photoFit.truncated).toBe(true);
+    expect(photoFit.caption.length).toBeLessThanOrEqual(TELEGRAM_CAPTION_LIMIT);
+    expect(photoFit.caption.endsWith(attribution)).toBe(true);
   });
 
   it('passes short captions through unchanged', () => {
