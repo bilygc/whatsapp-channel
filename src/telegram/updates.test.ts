@@ -7,6 +7,7 @@ import { applyMigrations } from '../db/migrate.js';
 import type { TelegramUpdate } from './api.js';
 import {
   applyStatusUpdate,
+  handleManualSubmission,
   parseCallbackData,
   pollOnce,
   processUpdate,
@@ -817,5 +818,319 @@ describe('processUpdate /img replies (manual image generation)', () => {
     expect(result).toEqual({ ticks: 2 });
     expect(calls).toBe(2);
     expect(events.length).toBeGreaterThan(0);
+  });
+});
+
+describe('processUpdate / handleManualSubmission (stateless manual article submission)', () => {
+  let dbs: Database.Database[] = [];
+  afterEach(() => {
+    for (const db of dbs) db.close();
+    dbs = [];
+    vi.restoreAllMocks();
+  });
+
+  function messageUpdate(
+    updateId: number,
+    opts: { text?: unknown; chatId?: number; messageId?: number } = {},
+  ): TelegramUpdate {
+    return {
+      update_id: updateId,
+      message: {
+        message_id: opts.messageId ?? 888,
+        chat: { id: opts.chatId ?? 123 },
+        ...(opts.text !== undefined ? { text: opts.text } : {}),
+      },
+    };
+  }
+
+  function htmlPageResponse(html: string): Response {
+    const bytes = new TextEncoder().encode(html);
+    return {
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === 'content-type' ? 'text/html; charset=utf-8' : null,
+      },
+      body: new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(bytes);
+          c.close();
+        },
+      }),
+      text: async () => html,
+    } as unknown as Response;
+  }
+
+  function llmResponse(content: string): Response {
+    const payload = JSON.stringify({
+      choices: [{ finish_reason: 'stop', message: { content } }],
+    });
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      arrayBuffer: async () => new TextEncoder().encode(payload).buffer as ArrayBuffer,
+      json: async () => JSON.parse(payload),
+    } as unknown as Response;
+  }
+
+  it('URL submission: fetches article metadata, generates caption + X post, edits status message, and writes nothing to DB', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const telegramBodies: Array<{ method: string; json: Record<string, unknown> }> = [];
+    const llmPrompts: string[] = [];
+    let pageFetches = 0;
+
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes('api.telegram.org')) {
+        const method = u.split('/').pop() ?? '';
+        const json = JSON.parse(init?.body as string) as Record<string, unknown>;
+        telegramBodies.push({ method, json });
+        if (method === 'sendMessage') return okResult({ message_id: 2001 });
+        return okResult(true);
+      }
+      if (u.includes('openrouter.ai')) {
+        const body = JSON.parse(init?.body as string) as {
+          messages: Array<{ role: string; content: string }>;
+        };
+        llmPrompts.push(body.messages[1].content);
+        if (llmPrompts.length === 1) {
+          return llmResponse(
+            '🔥 ¡Metroid Prime 4 tiene fecha de lanzamiento!\n\nLlegará en 2026 para Switch.\n\nFuente: IGN https://www.ign.com/articles/metroid-prime-4',
+          );
+        }
+        return llmResponse('¡Metroid Prime 4 llega en 2026! 🎮 #Metroid #Nintendo');
+      }
+      pageFetches += 1;
+      return htmlPageResponse(`
+        <html>
+          <head>
+            <meta property="og:title" content="Metroid Prime 4 Release Date Announced" />
+            <meta property="og:description" content="Retro Studios confirms 2026 launch." />
+            <meta property="og:site_name" content="IGN" />
+          </head>
+          <body>
+            <p>Samus returns in a brand new adventure across Viewros.</p>
+          </body>
+        </html>
+      `);
+    });
+
+    const lookupFn = vi.fn(async () => [{ address: '93.184.216.34' }]);
+    const deps: PollDeps = {
+      ...pollDeps(fetchFn as unknown as typeof fetch),
+      openrouterApiKey: 'or-secret-key',
+      lookupFn,
+    };
+
+    const outcome = await processUpdate(
+      db,
+      deps,
+      messageUpdate(90, { text: 'https://www.ign.com/articles/metroid-prime-4?utm_source=x' }),
+    );
+
+    expect(outcome).toBe('submitted');
+    expect(pageFetches).toBe(1);
+    expect(lookupFn).toHaveBeenCalledWith('www.ign.com');
+    expect(llmPrompts).toHaveLength(2);
+    expect(llmPrompts[0]).toContain('Metroid Prime 4 Release Date Announced');
+    expect(llmPrompts[0]).toContain('Samus returns in a brand new adventure across Viewros.');
+
+    expect(telegramBodies).toHaveLength(2);
+    expect(telegramBodies[0]).toMatchObject({
+      method: 'sendMessage',
+      json: { chat_id: '123', text: '✍️ Generando borrador…' },
+    });
+    expect(telegramBodies[1].method).toBe('editMessageText');
+    expect(telegramBodies[1].json.message_id).toBe(2001);
+    const finalText = telegramBodies[1].json.text as string;
+    expect(finalText).toContain('🔥 ¡Metroid Prime 4 tiene fecha de lanzamiento!');
+    expect(finalText).toContain('Fuente: IGN https://www.ign.com/articles/metroid-prime-4');
+    expect(finalText).toContain('𝕏 Post para X:');
+    expect(finalText).toContain('¡Metroid Prime 4 llega en 2026! 🎮 #Metroid #Nintendo');
+
+    // Stateless: zero rows written to articles or drafts.
+    expect((db.prepare('SELECT COUNT(*) AS n FROM articles').get() as { n: number }).n).toBe(0);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM drafts').get() as { n: number }).n).toBe(0);
+  });
+
+  it('SSRF block (private IP): blocks literal and DNS-rebinding private IPs before fetching or calling LLM, and edits status with sanitized error', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const telegramBodies: Array<{ method: string; json: Record<string, unknown> }> = [];
+    let externalFetches = 0;
+
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes('api.telegram.org')) {
+        const method = u.split('/').pop() ?? '';
+        const json = JSON.parse(init?.body as string) as Record<string, unknown>;
+        telegramBodies.push({ method, json });
+        if (method === 'sendMessage') return okResult({ message_id: 2002 });
+        return okResult(true);
+      }
+      externalFetches += 1;
+      throw new Error('should never fetch external or internal target');
+    });
+
+    // 1. Literal private IP via /submit
+    const depsLiteral: PollDeps = {
+      ...pollDeps(fetchFn as unknown as typeof fetch),
+      openrouterApiKey: 'or-secret-key',
+      lookupFn: vi.fn(async () => [{ address: '127.0.0.1' }]),
+    };
+    const out1 = await processUpdate(
+      db,
+      depsLiteral,
+      messageUpdate(91, { text: '/submit https://127.0.0.1/admin' }),
+    );
+    expect(out1).toBe('submit-error');
+    expect(externalFetches).toBe(0);
+    expect(telegramBodies).toHaveLength(2);
+    expect(telegramBodies[1].method).toBe('editMessageText');
+    expect(telegramBodies[1].json.text as string).toMatch(/^❌/);
+
+    // 2. Hostname resolving via DNS to RFC-1918 private IP
+    telegramBodies.length = 0;
+    const depsRebind: PollDeps = {
+      ...pollDeps(fetchFn as unknown as typeof fetch),
+      openrouterApiKey: 'or-secret-key',
+      lookupFn: vi.fn(async () => [{ address: '10.0.0.42' }]),
+    };
+    const out2 = await processUpdate(
+      db,
+      depsRebind,
+      messageUpdate(92, { text: '/nota https://internal.example.com/secret' }),
+    );
+    expect(out2).toBe('submit-error');
+    expect(externalFetches).toBe(0);
+    expect(telegramBodies).toHaveLength(2);
+    expect(telegramBodies[1].json.text as string).toMatch(/^❌.*blocked host/i);
+  });
+
+  it('full-text linkless submission: /nota with pasted text skips page fetch, omits Fuente line, and strips hallucinated links', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const telegramBodies: Array<{ method: string; json: Record<string, unknown> }> = [];
+    let pageFetches = 0;
+
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes('api.telegram.org')) {
+        const method = u.split('/').pop() ?? '';
+        const json = JSON.parse(init?.body as string) as Record<string, unknown>;
+        telegramBodies.push({ method, json });
+        if (method === 'sendMessage') return okResult({ message_id: 2003 });
+        return okResult(true);
+      }
+      if (u.includes('openrouter.ai')) {
+        return llmResponse(
+          [
+            '🎮 ¡Capcom anuncia nuevo Resident Evil!',
+            'Mira más en https://hallucinated.example/leak',
+            'Fuente: FakeSource https://hallucinated.example',
+            'El juego llegará en 2027 para consolas y PC. 🔥',
+          ].join('\n'),
+        );
+      }
+      pageFetches += 1;
+      throw new Error('should not fetch page on linkless text submission');
+    });
+
+    const lookupFn = vi.fn();
+    const deps: PollDeps = {
+      ...pollDeps(fetchFn as unknown as typeof fetch),
+      openrouterApiKey: 'or-secret-key',
+      lookupFn: lookupFn as unknown as PollDeps['lookupFn'],
+    };
+
+    const pastedText =
+      '/nota Capcom confirmed today during its showcase that the next mainline Resident Evil title is in development for PS5, Xbox Series X, and PC with a 2027 release window.';
+    const outcome = await processUpdate(db, deps, messageUpdate(93, { text: pastedText }));
+
+    expect(outcome).toBe('submitted');
+    expect(pageFetches).toBe(0);
+    expect(lookupFn).not.toHaveBeenCalled();
+    expect(telegramBodies).toHaveLength(2);
+    const finalText = telegramBodies[1].json.text as string;
+    expect(finalText).toContain('🎮 ¡Capcom anuncia nuevo Resident Evil!');
+    expect(finalText).toContain('El juego llegará en 2027 para consolas y PC. 🔥');
+    expect(finalText).not.toContain('Fuente:');
+    expect(finalText).not.toContain('hallucinated.example');
+    expect((db.prepare('SELECT COUNT(*) AS n FROM articles').get() as { n: number }).n).toBe(0);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM drafts').get() as { n: number }).n).toBe(0);
+  });
+
+  it('text + URL with >=100 chars text: uses pasted text without fetching the page, while keeping Fuente attribution', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const telegramBodies: Array<{ method: string; json: Record<string, unknown> }> = [];
+    let pageFetches = 0;
+
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes('api.telegram.org')) {
+        const method = u.split('/').pop() ?? '';
+        const json = JSON.parse(init?.body as string) as Record<string, unknown>;
+        telegramBodies.push({ method, json });
+        if (method === 'sendMessage') return okResult({ message_id: 2004 });
+        return okResult(true);
+      }
+      if (u.includes('openrouter.ai')) {
+        return llmResponse('🔥 ¡Nuevo anuncio de Zelda! Llegará pronto a Switch 2.');
+      }
+      pageFetches += 1;
+      throw new Error('should not fetch page when >=100 chars of text are pasted alongside URL');
+    });
+
+    const lookupFn = vi.fn();
+    const deps: PollDeps = {
+      ...pollDeps(fetchFn as unknown as typeof fetch),
+      openrouterApiKey: 'or-secret-key',
+      lookupFn: lookupFn as unknown as PollDeps['lookupFn'],
+    };
+
+    const longTextWithUrl =
+      '/submit Nintendo officially announced a brand new Legend of Zelda spin-off title during today Direct presentation, featuring cooperative dungeons and 60fps support https://www.polygon.com/zelda-coop-announced';
+    const outcome = await processUpdate(db, deps, messageUpdate(94, { text: longTextWithUrl }));
+
+    expect(outcome).toBe('submitted');
+    expect(pageFetches).toBe(0);
+    expect(lookupFn).not.toHaveBeenCalled();
+    const finalText = telegramBodies[1].json.text as string;
+    expect(finalText).toContain('Fuente: polygon.com https://www.polygon.com/zelda-coop-announced');
+  });
+
+  it('foreign-chat rejection: ignores submissions from unexpected chatId before any fetch, DNS lookup, LLM call, or Telegram sendMessage', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const fetchFn = vi.fn();
+    const lookupFn = vi.fn();
+    const events: string[] = [];
+    const deps: PollDeps = {
+      ...pollDeps(fetchFn as unknown as typeof fetch),
+      openrouterApiKey: 'or-secret-key',
+      lookupFn: lookupFn as unknown as PollDeps['lookupFn'],
+      onEvent: (m: string) => events.push(m),
+    };
+
+    const out1 = await processUpdate(
+      db,
+      deps,
+      messageUpdate(95, { text: 'https://www.ign.com/articles/test', chatId: 999 }),
+    );
+    const out2 = await handleManualSubmission(
+      deps,
+      { message_id: 1, chat: { id: 999 }, text: '/submit Some article text here' },
+      96,
+    );
+
+    expect(out1).toBe('foreign');
+    expect(out2).toBe('foreign');
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(lookupFn).not.toHaveBeenCalled();
+    expect(events).toHaveLength(2);
   });
 });

@@ -791,4 +791,27 @@ describe('generateDraft (two-call composer)', () => {
     // The caption call failed first: the X call never ran.
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
+
+  it('forwards body and allowLinkless to both prompt builders', async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(okResponse('🔥 caption sin link'))
+      .mockResolvedValueOnce(okResponse('¡Bombazo! #Videojuegos'));
+    const out = await generateDraft(
+      {
+        id: 0,
+        title: 'Manual Title',
+        source: '',
+        url: '',
+        body: 'Manual body excerpt for the LLM.',
+        allowLinkless: true,
+      },
+      deps({ fetchFn, sleep, callSpacingMs: 0 }),
+    );
+    expect(out).toEqual({ caption: '🔥 caption sin link', xPost: '¡Bombazo! #Videojuegos' });
+    const firstBody = JSON.parse((fetchFn.mock.calls[0] as [string, RequestInit])[1].body as string);
+    expect(firstBody.messages[1].content).toContain('Manual body excerpt for the LLM.');
+    expect(firstBody.messages[1].content).not.toContain('Article URL:');
+  });
 });

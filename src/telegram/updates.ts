@@ -16,9 +16,21 @@ import {
   type TelegramMessage,
   type TelegramUpdate,
 } from './api.js';
-import { fitCaptionForTelegram } from './caption.js';
+import {
+  buildTelegramMessage,
+  fitCaptionForTelegram,
+  TELEGRAM_MESSAGE_LIMIT,
+} from './caption.js';
 import { DEFAULT_IMAGE_MODEL } from '../images/openrouter.js';
 import { generateImageForDraft } from '../images/run.js';
+import { canonicalizeUrl, isSafeWebUrl } from '../fetcher/canonical.js';
+import { fetchArticleMetadata } from '../fetcher/page.js';
+import {
+  DEFAULT_LLM_MODEL,
+  generateDraft,
+  LLM_MAX_TOKENS,
+} from '../writer/openrouter.js';
+import { normalizeCaption, normalizeTweet } from '../writer/validate.js';
 
 export interface DraftAction {
   draftId: number;
@@ -101,6 +113,19 @@ export interface PollDeps extends TelegramDeps {
    * `generateImageForDraft`). Tests stub this to avoid network + disk.
    */
   runImage?: (db: Database.Database, draftId: number) => Promise<{ path: string }>;
+  /**
+   * OpenRouter key for stateless manual article submission (writer LLM).
+   * Falls back to `imageApiKey` when unset (both use OPENROUTER_API_KEY).
+   */
+  openrouterApiKey?: string;
+  /** LLM model slug for manual submission (default DEFAULT_LLM_MODEL). */
+  llmModel?: string;
+  /** Max tokens per LLM call for manual submission (default LLM_MAX_TOKENS). */
+  llmMaxTokens?: number;
+  /** Backoff/spacing sleep seam for tests. */
+  sleep?: (ms: number) => Promise<void>;
+  /** DNS lookup seam for SSRF validation in page fetches (tests inject fake IPs). */
+  lookupFn?: (hostname: string) => Promise<Array<{ address: string }>>;
 }
 
 export type UpdateOutcome =
@@ -112,7 +137,9 @@ export type UpdateOutcome =
   | 'ignored'
   | 'error'
   | 'image'
-  | 'image-error';
+  | 'image-error'
+  | 'submitted'
+  | 'submit-error';
 
 const ANSWER_TEXT: Record<string, string> = {
   posted: 'Marcado como publicado ✓',
@@ -155,6 +182,9 @@ export async function processUpdate(
   }
 
   if (update.message) {
+    if (isManualSubmissionText(update.message.text)) {
+      return handleManualSubmission(deps, update.message, update.update_id);
+    }
     return handleImageReply(db, deps, update.message, update.update_id);
   }
 
@@ -243,6 +273,222 @@ const IMG_COMMAND = '/img';
 
 const IMG_STATUS_START = '🎨 Generando imagen…';
 const IMG_STATUS_DONE = '✅ Imagen lista';
+
+const SUBMIT_STATUS_START = '✍️ Generando borrador…';
+const SUBMIT_TEXT_THRESHOLD_CHARS = 100;
+
+export function isManualSubmissionText(text: unknown): text is string {
+  if (typeof text !== 'string') return false;
+  const trimmed = text.trim();
+  if (/^\/(submit|nota)(?=$|\s)/i.test(trimmed)) return true;
+  if (/^https:\/\/\S+$/i.test(trimmed)) return true;
+  return false;
+}
+
+function sanitizeSubmissionError(message: string, deps: PollDeps): string {
+  let out = sanitizeTelegram(message, deps.token);
+  const orKey = deps.openrouterApiKey ?? '';
+  if (orKey !== '') out = out.split(orKey).join('[redacted]');
+  const imgKey = deps.imageApiKey ?? '';
+  if (imgKey !== '') out = out.split(imgKey).join('[redacted]');
+  return out;
+}
+
+/**
+ * Stateless manual article submission: handles `/submit ...`, `/nota ...`, or
+ * a bare single `https://...` URL message in the pinned operator chat.
+ *
+ * - Enforces TELEGRAM_CHAT_ID pinning BEFORE any fetch, DNS lookup, LLM call,
+ *   or Telegram send.
+ * - Sends `'✍️ Generando borrador…'` status message first.
+ * - URL with < 100 chars of accompanying text: fetches article metadata via
+ *   `fetchArticleMetadata` (SSRF-guarded).
+ * - URL with >= 100 chars of accompanying text: uses the pasted text directly
+ *   without fetching the page, while keeping the canonical URL for `Fuente:`.
+ * - Pasted text with no URL: generates a linkless draft (`allowLinkless: true`).
+ * - Edits the status message in place with the final paste-ready message
+ *   (or a sanitized `❌` error). Never touches SQLite.
+ */
+export async function handleManualSubmission(
+  deps: PollDeps,
+  message: TelegramMessage,
+  updateId = 0,
+): Promise<UpdateOutcome> {
+  const chatId = message.chat?.id;
+  if (chatId === undefined || String(chatId) !== deps.chatId) {
+    deps.onEvent?.(`ignoring update from unexpected chat (update ${updateId})`);
+    return 'foreign';
+  }
+
+  if (!isManualSubmissionText(message.text)) {
+    return 'ignored';
+  }
+
+  let statusId: number;
+  try {
+    const sent = await sendMessage(
+      { chatId: deps.chatId, text: SUBMIT_STATUS_START },
+      deps,
+      `submission ${updateId}`,
+    );
+    statusId = sent.message_id;
+  } catch (err) {
+    deps.onEvent?.(
+      `telegram manual submission status failed (update ${updateId}): ${sanitizeSubmissionError(err instanceof Error ? err.message : String(err), deps)}`,
+    );
+    return 'submit-error';
+  }
+
+  const failStatus = async (cause: string): Promise<void> => {
+    try {
+      await editMessageText(
+        {
+          chatId: deps.chatId,
+          messageId: statusId,
+          text: `❌ No se pudo generar el borrador: ${shortReason(cause)}`,
+        },
+        deps,
+        `submission ${updateId}`,
+      );
+    } catch (editErr) {
+      deps.onEvent?.(
+        `telegram manual submission status edit failed (update ${updateId}): ${sanitizeSubmissionError(editErr instanceof Error ? editErr.message : String(editErr), deps)}`,
+      );
+    }
+  };
+
+  const apiKey = (deps.openrouterApiKey ?? deps.imageApiKey ?? '').trim();
+  if (apiKey === '') {
+    const cause = 'missing OPENROUTER_API_KEY (writer LLM is not configured)';
+    deps.onEvent?.(`telegram manual submission failed (update ${updateId}): ${cause}`);
+    await failStatus(cause);
+    return 'submit-error';
+  }
+
+  try {
+    const rawBody = message.text.trim().replace(/^\/(submit|nota)\b/i, '').trim();
+    if (rawBody === '') {
+      throw new Error('empty submission: send a URL or article text');
+    }
+
+    const urlMatch = /https?:\/\/\S+/i.exec(rawBody);
+    const rawUrl = urlMatch ? urlMatch[0] : null;
+    const textWithoutUrl = rawUrl !== null ? rawBody.replace(rawUrl, '').trim() : rawBody;
+
+    let article: {
+      title: string;
+      source: string;
+      url: string;
+      body: string;
+      allowLinkless: boolean;
+    };
+
+    if (rawUrl !== null && textWithoutUrl.length < SUBMIT_TEXT_THRESHOLD_CHARS) {
+      const meta = await fetchArticleMetadata(rawUrl, {
+        fetchFn: deps.fetchFn,
+        ...(deps.lookupFn !== undefined ? { lookupFn: deps.lookupFn } : {}),
+      });
+      article = {
+        title: meta.title,
+        source: meta.source,
+        url: meta.url,
+        body: meta.body,
+        allowLinkless: false,
+      };
+    } else if (rawUrl !== null) {
+      if (!isSafeWebUrl(rawUrl)) {
+        throw new Error('blocked or unsafe article URL');
+      }
+      const canonical = canonicalizeUrl(rawUrl);
+      const source = new URL(canonical).hostname.replace(/^www\./i, '') || 'web';
+      const firstLine =
+        textWithoutUrl
+          .split('\n')
+          .map((l) => l.trim())
+          .find((l) => l !== '') ?? textWithoutUrl;
+      article = {
+        title: firstLine.slice(0, 300),
+        source,
+        url: canonical,
+        body: textWithoutUrl.slice(0, 2500),
+        allowLinkless: false,
+      };
+    } else {
+      const firstLine =
+        textWithoutUrl
+          .split('\n')
+          .map((l) => l.trim())
+          .find((l) => l !== '') ?? textWithoutUrl;
+      article = {
+        title: firstLine.slice(0, 300),
+        source: '',
+        url: '',
+        body: textWithoutUrl.slice(0, 2500),
+        allowLinkless: true,
+      };
+    }
+
+    const rawDraft = await generateDraft(
+      {
+        id: message.message_id,
+        title: article.title,
+        source: article.source,
+        url: article.url,
+        body: article.body,
+        allowLinkless: article.allowLinkless,
+      },
+      {
+        fetchFn: deps.fetchFn,
+        apiKey,
+        model: deps.llmModel ?? DEFAULT_LLM_MODEL,
+        maxTokens: deps.llmMaxTokens ?? LLM_MAX_TOKENS,
+        ...(deps.sleep !== undefined ? { sleep: deps.sleep, callSpacingMs: 0 } : {}),
+      },
+    );
+
+    const caption = normalizeCaption({
+      caption: rawDraft.caption,
+      source: article.source,
+      url: article.url,
+      allowLinkless: article.allowLinkless,
+    });
+
+    let xPost: string | null = null;
+    if (rawDraft.xPost !== null) {
+      try {
+        xPost = normalizeTweet({
+          tweet: rawDraft.xPost,
+          source: article.source,
+          url: article.url,
+          allowLinkless: article.allowLinkless,
+        });
+      } catch {
+        xPost = null;
+      }
+    }
+
+    const built = buildTelegramMessage(caption, xPost, TELEGRAM_MESSAGE_LIMIT);
+    if (!built.ok) {
+      throw new Error(built.error);
+    }
+
+    await editMessageText(
+      {
+        chatId: deps.chatId,
+        messageId: statusId,
+        text: built.caption,
+      },
+      deps,
+      `submission ${updateId}`,
+    );
+    return 'submitted';
+  } catch (err) {
+    const cause = sanitizeSubmissionError(err instanceof Error ? err.message : String(err), deps);
+    deps.onEvent?.(`telegram manual submission failed (update ${updateId}): ${cause}`);
+    await failStatus(cause);
+    return 'submit-error';
+  }
+}
 
 /** Same button shape as the sender (`src/telegram/send.ts`): kept local so the photo swap preserves the exact posted/skipped keyboard. */
 function buildKeyboard(draftId: number): {

@@ -291,6 +291,33 @@ describe('normalizeCaption', () => {
     expect(links).toHaveLength(1);
     expect(links[0]).toBe(URL);
   });
+
+  it('supports allowLinkless with empty url: skips Fuente requirement while still stripping hallucinated links and Fuente lines', () => {
+    const caption = [
+      '🔥 ¡Bombazo! Nuevo juego anunciado #Videojuegos',
+      'Mira https://hallucinated.example/phish',
+      'Visita www.fake.com hoy',
+      'Fuente: Invented https://fake.example',
+      'Llegará en otoño a consolas.',
+    ].join('\n');
+    const out = normalizeCaption({
+      caption,
+      source: '',
+      url: '',
+      allowLinkless: true,
+    });
+    expect(out).toContain('🔥 ¡Bombazo! Nuevo juego anunciado #Videojuegos');
+    expect(out).toContain('Llegará en otoño a consolas.');
+    expect(out).not.toContain('Fuente:');
+    expect(out).not.toContain('hallucinated.example');
+    expect(out).not.toContain('www.fake.com');
+  });
+
+  it('still rejects empty url when allowLinkless is not set', () => {
+    expect(() =>
+      normalizeCaption({ caption: '🔥 ¡Bombazo!', source: '', url: '' }),
+    ).toThrow(/^invalid article: url contains whitespace/);
+  });
 });
 
 describe('normalizeTweet', () => {
@@ -391,5 +418,11 @@ describe('normalizeTweet', () => {
     for (const match of out.matchAll(/https?:\/\/\S*/g)) {
       expect(body).toContain(match[0].replace(/…$/, ''));
     }
+  });
+
+  it('supports allowLinkless with empty url and still strips hallucinated links', () => {
+    const tweet = '¡Bombazo! #Videojuegos\nhttps://evil.example/x\nFuente: Fake';
+    const out = normalizeTweet({ tweet, source: '', url: '', allowLinkless: true });
+    expect(out).toBe('¡Bombazo! #Videojuegos');
   });
 });

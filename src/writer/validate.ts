@@ -10,12 +10,14 @@ export interface ValidateInput {
   caption: string;
   source: string;
   url: string;
+  allowLinkless?: boolean;
 }
 
 export interface TweetInput {
   tweet: string;
   source: string;
   url: string;
+  allowLinkless?: boolean;
 }
 
 /** Any linkable token in a body line: full URLs, mailto:, www. hosts, bare domains. */
@@ -160,12 +162,28 @@ export function normalizeCaption(input: ValidateInput): string {
   // above). If M3 ever accepts a source name from a remote payload, it must
   // be allowlisted here before reaching the draft.
   const cleanSource = scrub(input.source).trim();
+  const rawTrimmedUrl = input.url.trim();
   const cleanUrl = scrub(input.url).trim();
+  const isLinkless = Boolean(input.allowLinkless) && rawTrimmedUrl === '';
+
+  if (isLinkless) {
+    const bodyLines = text
+      .split('\n')
+      .filter((line) => !isAttributionLine(line))
+      .filter((line) => isCleanBodyLine(line, ''));
+    const body = bodyLines.join('\n').trim();
+    const truncated = truncateBodyAtBoundary(body, MAX_CAPTION_CHARS);
+    if (truncated === '') {
+      throw new Error('caption validation failed: empty reply');
+    }
+    return truncated;
+  }
+
   // Mirror the ingest rule (canonical.ts): the trimmed raw URL must not
   // contain control/inner-whitespace, and nothing whitespace-like may survive
   // scrubbing (a surviving \n would split the attribution line). Either way
   // the article is invalid yet retryable — never a multi-line draft.
-  if (cleanUrl === '' || /[\x00-\x20\x7F]/.test(input.url.trim()) || /\s/.test(cleanUrl)) {
+  if (cleanUrl === '' || /[\x00-\x20\x7F]/.test(rawTrimmedUrl) || /\s/.test(cleanUrl)) {
     throw new Error('invalid article: url contains whitespace/control characters');
   }
 
@@ -218,9 +236,13 @@ export function normalizeTweet(input: TweetInput): string {
   // Same legacy-row guard as normalizeCaption: a smuggled multi-line URL
   // must never reach the stored post. `source` is intentionally ignored —
   // the X post carries no attribution line, so there is nothing to fit.
+  const rawTrimmedUrl = input.url.trim();
   const cleanUrl = scrub(input.url).trim();
-  if (cleanUrl === '' || /[\x00-\x20\x7F]/.test(input.url.trim()) || /\s/.test(cleanUrl)) {
-    throw new Error('invalid article: url contains whitespace/control characters');
+  const isLinkless = Boolean(input.allowLinkless) && rawTrimmedUrl === '';
+  if (!isLinkless) {
+    if (cleanUrl === '' || /[\x00-\x20\x7F]/.test(rawTrimmedUrl) || /\s/.test(cleanUrl)) {
+      throw new Error('invalid article: url contains whitespace/control characters');
+    }
   }
 
   // Strip any model-written attribution lines and drop URL-bearing foreign
@@ -228,7 +250,7 @@ export function normalizeTweet(input: TweetInput): string {
   const bodyLines = text
     .split('\n')
     .filter((line) => !isAttributionLine(line))
-    .filter((line) => isCleanBodyLine(line, cleanUrl));
+    .filter((line) => isCleanBodyLine(line, isLinkless ? '' : cleanUrl));
   const cleaned = bodyLines
     .map((line) =>
       line

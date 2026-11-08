@@ -16,6 +16,7 @@
 import { config } from 'dotenv';
 import { applyMigrations, openDb, resolveDbPath } from '../db/migrate.js';
 import { resolveImageConfig } from '../images/openrouter.js';
+import { resolveLlmConfig } from '../writer/openrouter.js';
 import { resolveTelegramConfig } from '../telegram/config.js';
 import { sanitizeTelegram } from '../telegram/api.js';
 import { runTelegramListen } from '../telegram/updates.js';
@@ -48,6 +49,11 @@ async function main(): Promise<void> {
     // IMAGE_MODEL overrides the default image slug. When the key is unset
     // the listener still handles buttons — only `/img` fails gracefully.
     const { apiKey: imageApiKey, model: imageModel } = resolveImageConfig();
+    const {
+      apiKey: openrouterApiKey,
+      model: llmModel,
+      maxTokens: llmMaxTokens,
+    } = resolveLlmConfig();
     console.log(`Listening for draft buttons in chat ${scrub(chatId)} (Ctrl+C to stop)…`);
     await runTelegramListen(db, {
       fetchFn: fetch,
@@ -55,6 +61,9 @@ async function main(): Promise<void> {
       chatId,
       imageApiKey,
       imageModel,
+      openrouterApiKey,
+      llmModel,
+      llmMaxTokens,
       shouldStop: () => stopped,
       // The token must never reach the terminal — sanitize just in case an
       // error echoes request details, then scrub terminal-escape bytes.
