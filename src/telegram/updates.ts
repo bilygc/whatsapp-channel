@@ -18,7 +18,7 @@ import {
 } from './api.js';
 import {
   buildTelegramMessage,
-  fitCaptionForTelegram,
+  TELEGRAM_CAPTION_LIMIT,
   TELEGRAM_MESSAGE_LIMIT,
 } from './caption.js';
 import { DEFAULT_IMAGE_MODEL } from '../images/openrouter.js';
@@ -529,8 +529,8 @@ function contentTypeFor(filename: string): string {
  * Manual image generation (Phase 1): the operator replies `/img` to a
  * draft's Telegram message → a new image is generated via OpenRouter's
  * image model → the draft message's photo is swapped, keeping caption +
- * buttons. NO automatic generation happens anywhere else (writer, sender,
- * and this listener's callback path never call it).
+ * X section + buttons. NO automatic generation happens anywhere else
+ * (writer, sender, and this listener's callback path never call it).
  *
  * Flow: match the reply target to `drafts.telegram_message_id` → post a
  * "generating" status message → generate (60–90s+) → save bytes + stamp
@@ -539,8 +539,8 @@ function contentTypeFor(filename: string): string {
  * message to done. Any failure edits the status message to a short
  * sanitized reason and logs via onEvent; the loop continues either way
  * (log-and-continue). A failed generation never loses a draft: the
- * caption/buttons are untouched and `generated_image_path` keeps its old
- * value (or NULL).
+ * caption/X section/buttons are untouched and `generated_image_path` keeps
+ * its old value (or NULL).
  *
  * Never throws for message-driven failures — returns 'image' on success,
  * 'image-error' on failure, 'unknown' when no draft matches the reply
@@ -575,11 +575,13 @@ async function handleImageReply(
   }
   const targetMessageId = replyId as number;
 
-  let draft: { id: number; caption_es: string } | undefined;
+  let draft: { id: number; caption_es: string; x_post_es: string | null } | undefined;
   try {
     draft = db
-      .prepare(`SELECT id, caption_es FROM drafts WHERE telegram_message_id = ?`)
-      .get(targetMessageId) as { id: number; caption_es: string } | undefined;
+      .prepare(`SELECT id, caption_es, x_post_es FROM drafts WHERE telegram_message_id = ?`)
+      .get(targetMessageId) as
+      | { id: number; caption_es: string; x_post_es: string | null }
+      | undefined;
   } catch (err) {
     deps.onEvent?.(
       `telegram image lookup failed: ${sanitizeImageError(err instanceof Error ? err.message : String(err), deps)}`,
@@ -677,9 +679,12 @@ async function handleImageReply(
     return 'image-error';
   }
 
-  const fit = fitCaptionForTelegram(draft.caption_es);
+  // Photo captions use the 1024-char budget: rebuild the SAME caption + X
+  // section the sender shipped, so a photo swap never drops or truncates the
+  // X post. A NULL X post degrades to the caption-only fit.
+  const fit = buildTelegramMessage(draft.caption_es, draft.x_post_es, TELEGRAM_CAPTION_LIMIT);
   if (!fit.ok) {
-    // Never ship a linkless/overlong caption: leave caption + buttons
+    // Never ship a linkless/overlong message: leave caption + buttons
     // untouched (the image file stays saved + stamped for a later retry).
     const cause = sanitizeImageError(fit.error, deps);
     deps.onEvent?.(`telegram /img failed for draft ${draftId}: ${cause}`);
