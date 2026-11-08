@@ -1,8 +1,15 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyMigrations } from '../db/migrate.js';
+import { RSS_SOURCES } from './feeds.js';
 import { defaultDeps, runFetch, type FetchDeps } from './run.js';
 import type { NewArticle } from './store.js';
+
+// runFetch iterates every RSS_SOURCES entry and always adds one NewsData
+// source, so expected counts track the real feed list instead of a stale
+// hardcoded number.
+const rssCount = RSS_SOURCES.length;
+const totalSources = rssCount + 1;
 
 function openTestDb(): Database.Database {
   const db = new Database(':memory:');
@@ -45,10 +52,10 @@ describe('runFetch — per-source graceful degradation', () => {
         fetchNewsData: async () => [article('newsdata', 'https://example.com/nd/1')],
       }),
     );
-    expect(result.inserted).toBe(7); // 6 RSS + 1 NewsData
+    expect(result.inserted).toBe(totalSources); // all RSS + 1 NewsData
     expect(result.failed).toBe(0);
     expect(result.exitCode).toBe(0);
-    expect(result.sources).toHaveLength(7);
+    expect(result.sources).toHaveLength(totalSources);
     for (const s of result.sources) {
       expect(s).toMatchObject({ fetched: 1, inserted: 1, skipped: 0, failed: false });
     }
@@ -68,15 +75,16 @@ describe('runFetch — per-source graceful degradation', () => {
         fetchNewsData: async () => [],
       }),
     );
-    // 5 healthy RSS sources inserted; the broken one is reported, not thrown.
-    expect(result.inserted).toBe(5);
+    // Every healthy RSS source inserts one article; NewsData returns none,
+    // and the broken source is reported, not thrown.
+    expect(result.inserted).toBe(rssCount - 1);
     expect(result.failed).toBe(1);
     expect(result.exitCode).toBe(0);
     const broken = result.sources.find((s) => s.source === failing);
     expect(broken).toMatchObject({ failed: true });
     expect(broken?.error).toMatch(/timeout/);
     const count = db.prepare('SELECT COUNT(*) AS n FROM articles').get() as { n: number };
-    expect(count.n).toBe(5);
+    expect(count.n).toBe(rssCount - 1);
   });
 
   it('does not throw when a source returns malformed items; bad items are skipped, good ones kept', async () => {
@@ -112,7 +120,7 @@ describe('runFetch — per-source graceful degradation', () => {
         },
       }),
     );
-    expect(result.inserted).toBe(6);
+    expect(result.inserted).toBe(rssCount);
     expect(result.failed).toBe(1);
     expect(result.exitCode).toBe(0);
     expect(result.sources.find((s) => s.source === 'newsdata')).toMatchObject({
@@ -133,7 +141,7 @@ describe('runFetch — per-source graceful degradation', () => {
       }),
     );
     expect(fetchNewsData).not.toHaveBeenCalled();
-    expect(result.inserted).toBe(6);
+    expect(result.inserted).toBe(rssCount);
     expect(result.exitCode).toBe(0);
     expect(result.sources.find((s) => s.source === 'newsdata')).toMatchObject({
       failed: false,
@@ -156,7 +164,7 @@ describe('runFetch — per-source graceful degradation', () => {
         },
       }),
     );
-    expect(result.failed).toBe(7);
+    expect(result.failed).toBe(totalSources);
     expect(result.exitCode).toBe(1);
     expect(result.inserted).toBe(0);
   });
