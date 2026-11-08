@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyMigrations } from '../db/migrate.js';
+import { TELEGRAM_CAPTION_LIMIT, X_POST_SECTION_LABEL } from './caption.js';
 import type { TelegramUpdate } from './api.js';
 import {
   applyStatusUpdate,
@@ -417,7 +418,12 @@ describe('processUpdate /img replies (manual image generation)', () => {
   /** Seed a draft stamped as sent with a Telegram message id. */
   function seedImageDraft(
     db: Database.Database,
-    opts: { messageId?: number; caption?: string; imageUrl?: string | null } = {},
+    opts: {
+      messageId?: number;
+      caption?: string;
+      imageUrl?: string | null;
+      xPostEs?: string | null;
+    } = {},
   ): number {
     const url = `https://example.com/${Math.random().toString(36).slice(2)}`;
     const articleId = Number(
@@ -436,6 +442,11 @@ describe('processUpdate /img replies (manual image generation)', () => {
     db.prepare(
       `UPDATE drafts SET last_sent_at = ?, telegram_message_id = ? WHERE id = ?`,
     ).run('2026-10-19T08:55:00.000Z', opts.messageId ?? 440, id);
+    // Mirror send.test.ts: only stamp x_post_es when explicitly provided, so
+    // the default (NULL) exercises the legacy/caption-only path.
+    if (opts.xPostEs !== undefined) {
+      db.prepare(`UPDATE drafts SET x_post_es = ? WHERE id = ?`).run(opts.xPostEs, id);
+    }
     return id;
   }
 
@@ -530,6 +541,221 @@ describe('processUpdate /img replies (manual image generation)', () => {
     expect(keyboard.inline_keyboard[0][1].callback_data).toBe(`draft:${id}:skipped`);
     expect(bodies[2].json).toMatchObject({ text: '✅ Imagen lista' });
     expect(events).toEqual([]);
+  });
+
+  it('preserves the X post section when swapping the photo via /img', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    const xPost = '🎮 ¡Notición! #Gaming';
+    const id = seedImageDraft(db, { messageId: 440, xPostEs: xPost });
+    const imageFile = await stubImageFile(dir);
+    const methods: string[] = [];
+    const bodies: Array<{ method: string; json?: unknown; form?: FormData }> = [];
+    const deps = {
+      ...pollDeps(telegramFetch(methods, bodies) as unknown as typeof fetch),
+      imageApiKey: 'img-key',
+      runImage: (async () => ({ path: imageFile })) as PollDeps['runImage'],
+    };
+
+    const outcome = await processUpdate(db, deps, messageUpdate(61, { text: '/img', replyTo: 440 }));
+
+    expect(outcome).toBe('image');
+    expect(methods).toEqual(['sendMessage', 'editMessageMedia', 'editMessageText']);
+    const form = bodies[1].form as FormData;
+    const media = JSON.parse(form.get('media') as string) as Record<string, unknown>;
+    const caption = media.caption as string;
+    // Regression: /img used to rebuild the caption from caption_es alone,
+    // dropping the X section the original send included.
+    expect(caption).toContain('Fuente: IGN https://example.com/');
+    expect(caption).toContain(X_POST_SECTION_LABEL);
+    expect(caption).toContain(xPost);
+    expect(caption.endsWith(`\n\n${X_POST_SECTION_LABEL}\n${xPost}`)).toBe(true);
+    // The photo swap must still keep the exact posted/skipped keyboard.
+    const keyboard = JSON.parse(form.get('reply_markup') as string) as {
+      inline_keyboard: Array<Array<{ callback_data: string }>>;
+    };
+    expect(keyboard.inline_keyboard[0][0].callback_data).toBe(`draft:${id}:posted`);
+    expect(keyboard.inline_keyboard[0][1].callback_data).toBe(`draft:${id}:skipped`);
+  });
+
+  it('with NULL x_post_es, /img ships a caption-only message (no X section)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    const id = seedImageDraft(db, { messageId: 440, xPostEs: null });
+    const imageFile = await stubImageFile(dir);
+    const methods: string[] = [];
+    const bodies: Array<{ method: string; json?: unknown; form?: FormData }> = [];
+    const deps = {
+      ...pollDeps(telegramFetch(methods, bodies) as unknown as typeof fetch),
+      imageApiKey: 'img-key',
+      runImage: (async () => ({ path: imageFile })) as PollDeps['runImage'],
+    };
+
+    const outcome = await processUpdate(db, deps, messageUpdate(62, { text: '/img', replyTo: 440 }));
+
+    expect(outcome).toBe('image');
+    const form = bodies[1].form as FormData;
+    const media = JSON.parse(form.get('media') as string) as Record<string, unknown>;
+    const caption = media.caption as string;
+    expect(caption).toContain('Fuente: IGN https://example.com/');
+    expect(caption).not.toContain(X_POST_SECTION_LABEL);
+    // NULL X post is exactly the old caption-only fit (verbatim, no truncation).
+    const stored = (
+      db.prepare('SELECT caption_es FROM drafts WHERE id = ?').get(id) as { caption_es: string }
+    ).caption_es;
+    expect(caption).toBe(stored.trim());
+  });
+
+  it('overlong combined text shrinks the caption but keeps the full X section', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    const attribution = 'Fuente: IGN https://example.com/a';
+    const xPost = '🎮 ¡Notición! #Gaming';
+    const caption = `${'Palabra '.repeat(140).trim()}\n\n${attribution}`;
+    const section = `\n\n${X_POST_SECTION_LABEL}\n${xPost}`;
+    // Sanity-check the fixture really is over the 1024-char photo budget.
+    expect(caption.length + section.length).toBeGreaterThan(TELEGRAM_CAPTION_LIMIT);
+    seedImageDraft(db, { messageId: 440, caption, xPostEs: xPost });
+    const imageFile = await stubImageFile(dir);
+    const methods: string[] = [];
+    const bodies: Array<{ method: string; json?: unknown; form?: FormData }> = [];
+    const deps = {
+      ...pollDeps(telegramFetch(methods, bodies) as unknown as typeof fetch),
+      imageApiKey: 'img-key',
+      runImage: (async () => ({ path: imageFile })) as PollDeps['runImage'],
+    };
+
+    const outcome = await processUpdate(db, deps, messageUpdate(63, { text: '/img', replyTo: 440 }));
+
+    expect(outcome).toBe('image');
+    const form = bodies[1].form as FormData;
+    const media = JSON.parse(form.get('media') as string) as Record<string, unknown>;
+    const sent = media.caption as string;
+    expect(sent.length).toBeLessThanOrEqual(TELEGRAM_CAPTION_LIMIT);
+    // The WhatsApp caption was shrunk (attribution intact), never the X post.
+    expect(sent).toContain('…');
+    expect(sent).toContain(attribution);
+    expect(sent.endsWith(section)).toBe(true);
+    expect(sent).toContain(xPost);
+    expect(sent.length).toBeLessThan(caption.length + section.length);
+  });
+
+  it('overlong combined text with no attribution fails typed: no photo swap, X post never shipped', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    const xPost = '🎮 ¡Notición! #Gaming';
+    seedImageDraft(db, {
+      messageId: 440,
+      caption: `no attribution here ${'x'.repeat(1500)}`,
+      xPostEs: xPost,
+    });
+    const imageFile = await stubImageFile(dir);
+    const methods: string[] = [];
+    const bodies: Array<{ method: string; json?: unknown; form?: FormData }> = [];
+    const deps = {
+      ...pollDeps(telegramFetch(methods, bodies) as unknown as typeof fetch),
+      imageApiKey: 'img-key',
+      runImage: (async () => ({ path: imageFile })) as PollDeps['runImage'],
+    };
+
+    const outcome = await processUpdate(db, deps, messageUpdate(64, { text: '/img', replyTo: 440 }));
+
+    expect(outcome).toBe('image-error');
+    expect(methods).toEqual(['sendMessage', 'editMessageText']);
+    expect(methods).not.toContain('editMessageMedia');
+    expect((bodies[1].json as Record<string, unknown>).text as string).toMatch(/^❌/);
+  });
+
+  it('fails typed when the X section alone exceeds the photo budget (X post never truncated)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    // Defensive/legacy case: far longer than the writer's ≤280-char X cap.
+    const xPost = '🎮'.repeat(600);
+    expect(`\n\n${X_POST_SECTION_LABEL}\n${xPost}`.length).toBeGreaterThan(TELEGRAM_CAPTION_LIMIT);
+    seedImageDraft(db, { messageId: 440, xPostEs: xPost });
+    const imageFile = await stubImageFile(dir);
+    const methods: string[] = [];
+    const bodies: Array<{ method: string; json?: unknown; form?: FormData }> = [];
+    const deps = {
+      ...pollDeps(telegramFetch(methods, bodies) as unknown as typeof fetch),
+      imageApiKey: 'img-key',
+      runImage: (async () => ({ path: imageFile })) as PollDeps['runImage'],
+    };
+
+    const outcome = await processUpdate(db, deps, messageUpdate(65, { text: '/img', replyTo: 440 }));
+
+    expect(outcome).toBe('image-error');
+    expect(methods).toEqual(['sendMessage', 'editMessageText']);
+    expect(methods).not.toContain('editMessageMedia');
+  });
+
+  it('returns a typed error when the SQLite /img lookup fails, without generating', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    db.exec('DROP TABLE drafts');
+    const methods: string[] = [];
+    const events: string[] = [];
+    const runImage = vi.fn(async () => ({ path: 'x' }));
+    const deps = {
+      ...pollDeps(telegramFetch(methods, []) as unknown as typeof fetch),
+      imageApiKey: 'img-key',
+      runImage: runImage as PollDeps['runImage'],
+      onEvent: (m: string) => events.push(m),
+    };
+
+    const outcome = await processUpdate(db, deps, messageUpdate(66, { text: '/img', replyTo: 440 }));
+
+    expect(outcome).toBe('error');
+    expect(runImage).not.toHaveBeenCalled();
+    expect(methods).toEqual([]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatch(/^telegram image lookup failed: /);
+  });
+
+  it('returns image-error (typed, no crash) when the Telegram photo swap fails', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const dir = await tmpDir();
+    const id = seedImageDraft(db, { messageId: 440, xPostEs: '🎮 ¡Hola! #Gaming' });
+    const imageFile = await stubImageFile(dir);
+    const methods: string[] = [];
+    const bodies: Array<{ method: string; json?: unknown; form?: FormData }> = [];
+    const events: string[] = [];
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = String(url).split('/').pop() ?? '';
+      methods.push(method);
+      if (method === 'sendMessage') return okResult({ message_id: 1001 });
+      if (method === 'editMessageMedia') {
+        throw new Error('telegram editMessageMedia failed for draft: HTTP 429');
+      }
+      if (method === 'editMessageText') {
+        bodies.push({ method, json: init?.body ? JSON.parse(init.body as string) : undefined });
+        return okResult(true);
+      }
+      return okResult(true);
+    });
+    const deps = {
+      ...pollDeps(fetchFn as unknown as typeof fetch),
+      imageApiKey: 'img-key',
+      runImage: (async () => ({ path: imageFile })) as PollDeps['runImage'],
+      onEvent: (m: string) => events.push(m),
+    };
+
+    const outcome = await processUpdate(db, deps, messageUpdate(67, { text: '/img', replyTo: 440 }));
+
+    expect(outcome).toBe('image-error');
+    expect(methods).toEqual(['sendMessage', 'editMessageMedia', 'editMessageText']);
+    expect((bodies[0].json as Record<string, unknown>).text as string).toMatch(/^❌/);
+    expect(events).toHaveLength(1);
+    // A failed swap never loses the draft: caption/buttons/status untouched.
+    expect(
+      (db.prepare('SELECT status FROM drafts WHERE id = ?').get(id) as { status: string }).status,
+    ).toBe('pending');
   });
 
   it('requires the EXACT /img text (prose and suffixed commands are ignored)', async () => {
