@@ -1,7 +1,14 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { applyMigrations } from '../db/migrate.js';
-import { scoreArticle, selectTopArticles } from './select.js';
+import {
+  RECENT_LOOKBACK_DAYS,
+  SIMILARITY_THRESHOLD,
+  normalizeTitle,
+  scoreArticle,
+  selectTopArticles,
+  titleSimilarity,
+} from './select.js';
 
 function openTestDb(): Database.Database {
   const db = new Database(':memory:');
@@ -168,5 +175,166 @@ describe('selectTopArticles', () => {
     dbs.push(db);
     db.exec('DROP TABLE articles');
     expect(() => selectTopArticles(db, { now: NOW })).toThrow(/^select failed: /);
+  });
+});
+
+describe('normalizeTitle', () => {
+  it('lowercases, strips punctuation, and removes stopwords', () => {
+    expect(normalizeTitle('GTA 6: Official Trailer!')).toEqual(['6', 'gta', 'trailer']);
+  });
+
+  it('collapses the Grand Theft Auto alias and roman numeral VI to the same tokens as GTA 6', () => {
+    expect(normalizeTitle('Grand Theft Auto VI')).toEqual(['6', 'gta']);
+    expect(normalizeTitle('Grand Theft Auto VI')).toEqual(normalizeTitle('GTA 6'));
+  });
+
+  it('folds accents and maps other roman numerals', () => {
+    expect(normalizeTitle('Pokémon VII')).toEqual(['7', 'pokemon']);
+  });
+
+  it('returns an empty token set for empty or all-stopword titles', () => {
+    expect(normalizeTitle('')).toEqual([]);
+    expect(normalizeTitle('The and of')).toEqual([]);
+  });
+
+  it('keeps distinct inline URLs as opaque tokens so different links stay dissimilar', () => {
+    // A URL embedded in a title is an identifier, not prose: two distinct
+    // links must not collapse into the same "https example com" token set.
+    expect(normalizeTitle('Title https://example.com/a')).not.toEqual(
+      normalizeTitle('Title https://example.com/b'),
+    );
+    expect(
+      titleSimilarity('Title https://example.com/a', 'Title https://example.com/b'),
+    ).toBeLessThan(SIMILARITY_THRESHOLD);
+  });
+});
+
+describe('titleSimilarity', () => {
+  it('is 1 for identical or alias-equivalent titles', () => {
+    expect(titleSimilarity('GTA 6 Trailer', 'Grand Theft Auto VI Trailer')).toBe(1);
+  });
+
+  it('is 0 for disjoint topics', () => {
+    expect(titleSimilarity('Zelda DLC', 'Elden Ring Patch')).toBe(0);
+  });
+
+  it('computes token-set Jaccard (0.5 and 0.6)', () => {
+    expect(titleSimilarity('alpha bravo charlie', 'alpha bravo delta')).toBeCloseTo(0.5);
+    expect(titleSimilarity('alpha bravo charlie delta', 'alpha bravo charlie echo')).toBeCloseTo(0.6);
+  });
+
+  it('treats empty/all-stopword titles as non-matching (never NaN, never a false veto)', () => {
+    expect(titleSimilarity('', '')).toBe(0);
+    expect(titleSimilarity('the and of', 'GTA 6')).toBe(0);
+  });
+
+  it('places crafted pairs on either side of the tunable threshold', () => {
+    expect(titleSimilarity('alpha bravo charlie', 'alpha bravo delta')).toBeLessThan(SIMILARITY_THRESHOLD);
+    expect(titleSimilarity('GTA 6 Trailer', 'GTA VI Trailer')).toBeGreaterThanOrEqual(SIMILARITY_THRESHOLD);
+  });
+});
+
+describe('selectTopArticles — diversity veto', () => {
+  let dbs: Database.Database[] = [];
+  afterEach(() => {
+    for (const db of dbs) db.close();
+    dbs = [];
+  });
+
+  it('selects only one of several same-event articles from different outlets in one batch', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seed(db, [
+      { title: 'GTA 6 Trailer Reveals Release Date', url: 'https://example.com/ign', publishedAt: NOW.toISOString() },
+      { title: 'Grand Theft Auto VI Gets a Release Date in New Trailer', url: 'https://example.com/polygon', publishedAt: NOW.toISOString() },
+      { title: 'Rockstar Confirms GTA 6 Release Date with Trailer', url: 'https://example.com/eurogamer', publishedAt: NOW.toISOString() },
+      { title: 'GTA VI Release Date Announced, Trailer Out Now', url: 'https://example.com/newsdata', publishedAt: NOW.toISOString() },
+    ]);
+    const result = selectTopArticles(db, { now: NOW, limit: 4 });
+    expect(result.scored).toBe(4);
+    expect(result.selected).toHaveLength(1);
+    const row = db.prepare(`SELECT COUNT(*) AS n FROM articles WHERE status = 'selected'`).get() as { n: number };
+    expect(row.n).toBe(1);
+  });
+
+  it('still selects all articles when topics are dissimilar', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seed(db, [
+      { title: 'GTA 6 Trailer Reveals Release Date', url: 'https://example.com/a', publishedAt: NOW.toISOString() },
+      { title: 'Zelda Tears of the Kingdom DLC Launches', url: 'https://example.com/b', publishedAt: NOW.toISOString() },
+      { title: 'Elden Ring Nightreign Patch Notes', url: 'https://example.com/c', publishedAt: NOW.toISOString() },
+      { title: 'Minecraft Copper Golem Mob Added', url: 'https://example.com/d', publishedAt: NOW.toISOString() },
+    ]);
+    const result = selectTopArticles(db, { now: NOW, limit: 4 });
+    expect(result.selected).toHaveLength(4);
+  });
+
+  it('blocks a similar new article when the same story was selected in a previous run', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const day2 = new Date(NOW.getTime() + 24 * 3600_000);
+    seed(db, [
+      { title: 'GTA 6 Trailer Reveals Release Date', url: 'https://example.com/run1', publishedAt: NOW.toISOString() },
+    ]);
+    const first = selectTopArticles(db, { now: NOW, limit: 1 });
+    expect(first.selected).toHaveLength(1);
+
+    seed(db, [
+      { title: 'Grand Theft Auto VI Trailer Reveals Release Date', url: 'https://example.com/run2', publishedAt: day2.toISOString() },
+    ]);
+    const second = selectTopArticles(db, { now: day2, limit: 1 });
+    expect(second.scored).toBe(1);
+    expect(second.selected).toHaveLength(0);
+  });
+
+  it('ignores history older than the lookback window', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    const old = new Date(NOW.getTime() - (RECENT_LOOKBACK_DAYS + 3) * 24 * 3600_000).toISOString();
+    seed(db, [
+      { title: 'GTA 6 Trailer Reveals Release Date', url: 'https://example.com/old', publishedAt: old, status: 'used' },
+      { title: 'Grand Theft Auto VI Trailer Reveals Release Date', url: 'https://example.com/new', publishedAt: NOW.toISOString() },
+    ]);
+    const result = selectTopArticles(db, { now: NOW, limit: 1 });
+    expect(result.selected.map((a) => a.url)).toEqual(['https://example.com/new']);
+  });
+
+  it('keeps both articles when their similarity is just below the threshold', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seed(db, [
+      { title: 'alpha bravo charlie', url: 'https://example.com/a', publishedAt: NOW.toISOString() },
+      { title: 'alpha bravo delta', url: 'https://example.com/b', publishedAt: NOW.toISOString() },
+    ]);
+    const result = selectTopArticles(db, { now: NOW, limit: 2 });
+    expect(result.selected).toHaveLength(2);
+  });
+
+  it('vetoes one article when their similarity reaches the threshold', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seed(db, [
+      { title: 'alpha bravo charlie delta', url: 'https://example.com/a', publishedAt: NOW.toISOString() },
+      { title: 'alpha bravo charlie echo', url: 'https://example.com/b', publishedAt: NOW.toISOString() },
+    ]);
+    const result = selectTopArticles(db, { now: NOW, limit: 2 });
+    expect(result.selected).toHaveLength(1);
+  });
+
+  it('translates a failure in the recent-history query into a typed error', () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seed(db, [
+      { title: 'GTA 6 Trailer', url: 'https://example.com/a', publishedAt: NOW.toISOString() },
+    ]);
+    const failingDb = {
+      prepare: (sql: string) => {
+        if (sql.includes('status IN')) throw new Error('history boom');
+        return db.prepare(sql);
+      },
+      transaction: db.transaction.bind(db),
+    } as unknown as Database.Database;
+    expect(() => selectTopArticles(failingDb, { now: NOW })).toThrow(/^select failed: history boom/);
   });
 });
