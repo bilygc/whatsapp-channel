@@ -60,6 +60,7 @@ export const KEYWORDS = [
   'playstation',
   'ps5',
   'xbox',
+  'pc',
   'nintendo',
   'elden ring',
   'minecraft',
