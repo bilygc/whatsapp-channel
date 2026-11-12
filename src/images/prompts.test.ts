@@ -282,3 +282,43 @@ describe('buildImageFallbackPrompt', () => {
     expect(prompt).not.toMatch(/The text generated in the image should be in Spanish/i);
   });
 });
+
+describe('in-image dates rule (both prompt builders)', () => {
+  it('buildImagePrompt forbids rendering dates unless a date appears in the caption context', () => {
+    const prompt = buildImagePrompt({ title: 't', hasReferenceImage: false, hasLogoImage: false });
+    expect(prompt).toMatch(/DATES:/i);
+    expect(prompt).toMatch(/do NOT render any date/i);
+    expect(prompt).toMatch(/caption/i);
+    expect(prompt).toMatch(/only when/i);
+    // Standalone top-of-prompt directive, right after the text-language line.
+    const lines = prompt.split('\n');
+    const dateIdx = lines.findIndex((l) => /^DATES:/.test(l));
+    const langIdx = lines.findIndex((l) => /^TEXT LANGUAGE:/.test(l));
+    const moodIdx = lines.findIndex((l) => /Mood rules/.test(l));
+    expect(dateIdx).toBe(langIdx + 1);
+    expect(dateIdx).toBeLessThan(moodIdx);
+  });
+
+  it('buildImagePrompt lets a date through only via the caption context, never invented', () => {
+    const prompt = buildImagePrompt({
+      title: 't',
+      captionEs: 'Llegará el 15 de marzo de 2026',
+      hasReferenceImage: false,
+      hasLogoImage: false,
+    });
+    expect(prompt).toContain('15 de marzo de 2026');
+    expect(prompt).toMatch(/DATES:.*caption/i);
+    expect(prompt).toMatch(/do NOT render any date/i);
+  });
+
+  it('buildImageFallbackPrompt keeps the no-dates rule', () => {
+    const prompt = buildImageFallbackPrompt({
+      title: 't',
+      hasReferenceImage: false,
+      hasLogoImage: false,
+    });
+    expect(prompt).toMatch(/DATES:/i);
+    expect(prompt).toMatch(/do NOT render any date/i);
+    expect(prompt).toMatch(/caption/i);
+  });
+});

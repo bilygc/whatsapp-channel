@@ -123,6 +123,16 @@ describe('generateImage', () => {
     expect(body).not.toHaveProperty('image_config');
   });
 
+  it('forwards the image prompt verbatim so in-image directives (e.g. the no-dates rule) reach the wire', async () => {
+    const d = deps();
+    const prompt =
+      'Create an ORIGINAL illustration.\nDATES: do NOT render any date, year, or release date in the image unless one appears in the caption context.';
+    await generateImage({ scope: 'draft 1', prompt }, d);
+    const [, init] = (d.fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect((JSON.parse(init.body as string) as { prompt: string }).prompt).toBe(prompt);
+    expect(init.body as string).toMatch(/do NOT render any date/i);
+  });
+
   it('omits input_references when no reference is given (text-only)', async () => {
     const d = deps();
     await generateImage({ scope: 'draft 1', prompt: 'a dark console' }, d);

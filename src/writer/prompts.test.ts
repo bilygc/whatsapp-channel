@@ -250,3 +250,44 @@ describe('buildXUserPrompt', () => {
     expect(prompt).not.toContain('Article URL:');
   });
 });
+
+describe('SYSTEM_PROMPT (Latin American Spanish)', () => {
+  it('requires strictly Latin American Spanish and explicitly bans European/Peninsular Spanish (vosotros)', () => {
+    expect(SYSTEM_PROMPT).toMatch(/latin american|latinoamericano/i);
+    expect(SYSTEM_PROMPT).toMatch(/european|peninsular/i);
+    expect(SYSTEM_PROMPT).toMatch(/vosotros/i);
+    expect(SYSTEM_PROMPT).toMatch(/ustedes/i);
+  });
+
+  it('keeps the original caption rules intact (own words, hook headline, emojis, Fuente, 1500 chars)', () => {
+    expect(SYSTEM_PROMPT).toMatch(/own words/i);
+    expect(SYSTEM_PROMPT).toMatch(/hook headline/i);
+    expect(SYSTEM_PROMPT).toMatch(/emojis/i);
+    expect(SYSTEM_PROMPT).toMatch(/Fuente:/);
+    expect(SYSTEM_PROMPT).toMatch(/1500/);
+  });
+});
+
+describe('X_SYSTEM_PROMPT (fuller 280-char post)', () => {
+  it('aims to leverage the 280-char limit with 1-2 fuller sentences + 1-3 hashtags, not overly short', () => {
+    expect(X_SYSTEM_PROMPT).toMatch(/1-2 full|full, well-developed/i);
+    expect(X_SYSTEM_PROMPT).toMatch(/overly short|one-liner|makes the most of/i);
+    expect(X_SYSTEM_PROMPT).toMatch(/1-3 relevant hashtags/i);
+    expect(X_SYSTEM_PROMPT).toMatch(/under 280/);
+    expect(X_SYSTEM_PROMPT).toMatch(/do not include/i);
+    expect(X_SYSTEM_PROMPT).not.toMatch(/Fuente:/);
+  });
+});
+
+describe('buildXUserPrompt (fuller 280-char post)', () => {
+  it('asks for 1-2 fuller sentences + 1-3 hashtags that use the 280-char budget, and keeps no links/attribution', () => {
+    const prompt = buildXUserPrompt(ARTICLE);
+    expect(prompt).toMatch(/1-2 full|full, substantive/i);
+    expect(prompt).toMatch(/use the 280-character limit well/i);
+    expect(prompt).toMatch(/not an overly short one-liner/i);
+    expect(prompt).toMatch(/1-3 relevant hashtags/i);
+    expect(prompt).toMatch(/280 characters/i);
+    expect(prompt).toMatch(/do not add/i);
+    expect(prompt).not.toContain(`Fuente: ${ARTICLE.source}`);
+  });
+});

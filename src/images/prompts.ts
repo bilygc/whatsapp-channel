@@ -64,6 +64,17 @@ const TEXT_LANGUAGE_LINE =
   'TEXT LANGUAGE: any text rendered inside the image (wordmarks, signs, headlines, UI, captions) MUST be in Spanish — never in English.';
 
 /**
+ * In-image dates: image models tend to stamp a release year/date onto posters,
+ * signs, or calendars even when the story has none, which reads as invented
+ * news. A date may appear in the image ONLY when that same date is literally
+ * written in the stored Spanish caption passed as post context below; if the
+ * caption has no date, the image must contain none. Kept as a standalone line
+ * beside TEXT_LANGUAGE_LINE (both govern text rendered inside the image).
+ */
+const NO_DATES_LINE =
+  'DATES: do NOT render any date, year, or release date in the image (no dates on posters, signs, calendars, UI, or captions). ONLY when the post caption context below literally contains a date may that exact date appear in the image; if the caption has no date, the image must contain no date at all.';
+
+/**
  * Brand-logo integration note, emitted ONLY when the logo rides along as
  * an attached reference image (lone or second — position on the wire may
  * vary: [news?, logo?] or [logo] when no news image). The model cannot
@@ -94,6 +105,7 @@ export function buildImagePrompt(input: ImagePromptInput): string {
     // 'Create an ORIGINAL illustration for a video-game news post. Do NOT copy any existing artwork, game screenshots, logos, or box art — an original composition in your own style only.',
     openingLine,
     TEXT_LANGUAGE_LINE,
+    NO_DATES_LINE,
     'DO NOT put any other video game blog or news names in the image, only the company names and the game title.',
     '',
     MOOD_RULES,
@@ -138,6 +150,7 @@ export function buildImageFallbackPrompt(input: ImagePromptInput): string {
   const lines = [
     openingLine,
     TEXT_LANGUAGE_LINE,
+    NO_DATES_LINE,
     '',
     namedBanLine,
     '',
