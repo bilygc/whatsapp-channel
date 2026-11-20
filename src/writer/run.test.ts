@@ -1,7 +1,13 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyMigrations } from '../db/migrate.js';
-import { runWriter, saveDraft, type WriterDeps } from './run.js';
+import {
+  LLM_INTER_ARTICLE_DELAY_MS,
+  resolveInterArticleDelayMs,
+  runWriter,
+  saveDraft,
+  type WriterDeps,
+} from './run.js';
 
 function openTestDb(): Database.Database {
   const db = new Database(':memory:');
@@ -37,6 +43,8 @@ function deps(overrides: Partial<WriterDeps> = {}): WriterDeps {
     now: () => new Date('2026-10-17T12:00:00.000Z'),
     generate: async (article) =>
       `🔥 ${article.title}\n\n#Videojuegos\n\nFuente: ${article.source} ${article.url}`,
+    // Noop pacer keeps every pre-existing test instant; pacing tests inject a spy.
+    sleep: async () => {},
     ...overrides,
   };
 }
@@ -187,6 +195,136 @@ describe('runWriter', () => {
     const summary = await runWriter(db, deps());
 
     expect(summary).toMatchObject({ total: 2, written: 2, failed: 0 });
+  });
+});
+
+describe('runWriter inter-article pacing (free-tier 20 RPM)', () => {
+  let dbs: Database.Database[] = [];
+  afterEach(() => {
+    for (const db of dbs) db.close();
+    dbs = [];
+    vi.restoreAllMocks();
+  });
+
+  it('spaces every article except the first by a jittered delay', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [
+      { url: 'https://example.com/a' },
+      { url: 'https://example.com/b' },
+      { url: 'https://example.com/c' },
+    ]);
+    const sleep = vi.fn(async (_ms: number) => {});
+
+    const summary = await runWriter(db, deps({ sleep, interArticleDelayMs: 1000, random: () => 0.5 }));
+
+    expect(summary.written).toBe(3);
+    // 3 articles → 2 gaps (before b and c); no delay before the first.
+    expect(sleep).toHaveBeenCalledTimes(2);
+    // r=0.5 cancels the ±20% jitter → exactly the base delay.
+    expect(sleep).toHaveBeenNthCalledWith(1, 1000);
+    expect(sleep).toHaveBeenNthCalledWith(2, 1000);
+  });
+
+  it('keeps the jitter within ±20% of the base delay', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [
+      { url: 'https://example.com/a' },
+      { url: 'https://example.com/b' },
+      { url: 'https://example.com/c' },
+    ]);
+    const sleep = vi.fn(async (_ms: number) => {});
+    // First gap → min (0.8×), second → max (1.2×).
+    const random = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(1);
+
+    await runWriter(db, deps({ sleep, interArticleDelayMs: 6000, random }));
+
+    const delays = sleep.mock.calls.map((c) => c[0] as number);
+    expect(delays).toEqual([4800, 7200]);
+    for (const d of delays) {
+      expect(d).toBeGreaterThanOrEqual(4800);
+      expect(d).toBeLessThanOrEqual(7200);
+    }
+  });
+
+  it('paces even after a failed article (a burst of retries still trickles out)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [
+      { url: 'https://example.com/ok1' },
+      { url: 'https://example.com/bad' },
+      { url: 'https://example.com/ok2' },
+    ]);
+    const sleep = vi.fn(async (_ms: number) => {});
+
+    const summary = await runWriter(
+      db,
+      deps({
+        sleep,
+        interArticleDelayMs: 1000,
+        random: () => 0.5,
+        generate: async (article) => {
+          if (article.url.endsWith('/bad')) throw new Error('llm write failed: 429');
+          return `🔥 caption\n\nFuente: ${article.source} ${article.url}`;
+        },
+      }),
+    );
+
+    expect(summary.written).toBe(2);
+    expect(summary.failed).toBe(1);
+    // Both gaps still paced despite the middle article failing.
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it('disables pacing when interArticleDelayMs is 0', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [{ url: 'https://example.com/a' }, { url: 'https://example.com/b' }]);
+    const sleep = vi.fn(async (_ms: number) => {});
+
+    await runWriter(db, deps({ sleep, interArticleDelayMs: 0 }));
+
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('a broken pacer never drops an article (pacing is best-effort)', async () => {
+    const db = openTestDb();
+    dbs.push(db);
+    seedSelected(db, [{ url: 'https://example.com/a' }, { url: 'https://example.com/b' }]);
+    const sleep = vi.fn(async (_ms: number) => {
+      throw new Error('timer exploded');
+    });
+
+    const summary = await runWriter(db, deps({ sleep, interArticleDelayMs: 1000 }));
+
+    expect(summary.written).toBe(2);
+    expect(summary.failed).toBe(0);
+    expect(summary.results.every((r) => r.ok)).toBe(true);
+  });
+});
+
+describe('resolveInterArticleDelayMs', () => {
+  it('defaults to 6000 when LLM_INTER_ARTICLE_DELAY_MS is unset', () => {
+    expect(LLM_INTER_ARTICLE_DELAY_MS).toBe(6000);
+    expect(resolveInterArticleDelayMs({})).toBe(6000);
+  });
+
+  it('honours a valid env override (trims whitespace)', () => {
+    expect(resolveInterArticleDelayMs({ LLM_INTER_ARTICLE_DELAY_MS: '3000' })).toBe(3000);
+    expect(resolveInterArticleDelayMs({ LLM_INTER_ARTICLE_DELAY_MS: '  3000  ' })).toBe(3000);
+  });
+
+  it('accepts 0 as an explicit disable (distinct from unset)', () => {
+    expect(resolveInterArticleDelayMs({ LLM_INTER_ARTICLE_DELAY_MS: '0' })).toBe(0);
+  });
+
+  it('falls back to the default on invalid values', () => {
+    for (const bad of ['abc', '', '   ', '-5', '12.5', 'NaN', 'Infinity']) {
+      expect(resolveInterArticleDelayMs({ LLM_INTER_ARTICLE_DELAY_MS: bad })).toBe(
+        LLM_INTER_ARTICLE_DELAY_MS,
+      );
+    }
   });
 });
 

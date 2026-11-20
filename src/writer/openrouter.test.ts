@@ -52,6 +52,29 @@ function statusResponse(status: number, retryAfter: string | null = null): Respo
   } as unknown as Response;
 }
 
+/** Mock a 429 carrying OpenRouter rate-limit headers and an error body (metadata.provider_code). */
+function rateLimitedResponse(headers: Record<string, string> = {}, providerCode?: string): Response {
+  const body =
+    providerCode === undefined
+      ? { error: { code: 429, message: 'Rate limit exceeded' } }
+      : {
+          error: {
+            code: 429,
+            message: 'Rate limit exceeded',
+            metadata: { provider_code: providerCode },
+          },
+        };
+  const json = JSON.stringify(body);
+  return {
+    ok: false,
+    status: 429,
+    headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+    arrayBuffer: async () => new TextEncoder().encode(json).buffer as ArrayBuffer,
+    json: async () => body,
+    body: { cancel: async () => {} },
+  } as unknown as Response;
+}
+
 /** Mock a 200 response with an arbitrary JSON body (reasoning-model shapes). */
 function bodyResponse(body: unknown): Response {
   return {
@@ -243,6 +266,34 @@ describe('generateCaption', () => {
     expect(cancelled).toBe(true);
     // Persistent 429s exhaust the long rate-limit budget: 1 initial + 3 retries.
     expect(fetchFn).toHaveBeenCalledTimes(4);
+  });
+
+  it('enriches an exhausted 429 with X-RateLimit headers and error.metadata.provider_code', async () => {
+    const fetchFn = vi.fn(async () =>
+      rateLimitedResponse(
+        {
+          'x-ratelimit-limit': '20',
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': '1700000000',
+        },
+        'upstream_rate_limited',
+      ),
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.toThrow(
+      /HTTP 429 \(rate limited, gave up after 3 retries\) \[limit=20, remaining=0, reset=1700000000, provider_code=upstream_rate_limited\]$/,
+    );
+  });
+
+  it('scrubs control bytes out of provider-controlled rate-limit values', async () => {
+    const fetchFn = vi.fn(async () =>
+      rateLimitedResponse({ 'x-ratelimit-limit': '20\n\x1b[31m', 'x-ratelimit-remaining': '0' }),
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.toThrow(
+      /limit=20/,
+    );
+    await expect(generateCaption(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.not.toThrow(
+      /\x1b/,
+    );
   });
 
   it('cancels the body when the declared content-length overflows (no leak)', async () => {
@@ -699,6 +750,15 @@ describe('generateXPost', () => {
     expect(sleep).toHaveBeenNthCalledWith(3, 30000);
   });
 
+  it('enriches an exhausted 429 with X-RateLimit headers (X-post path)', async () => {
+    const fetchFn = vi.fn(async () =>
+      rateLimitedResponse({ 'x-ratelimit-limit': '1000', 'x-ratelimit-remaining': '0' }),
+    );
+    await expect(generateXPost(ARTICLE, deps({ fetchFn, sleep: async () => {} }))).rejects.toThrow(
+      /^llm xpost failed for article 1: HTTP 429 \(rate limited, gave up after 3 retries\) \[limit=1000, remaining=0\]$/,
+    );
+  });
+
   it('honours a Retry-After response header (delay-seconds) over the schedule', async () => {
     const sleep = vi.fn(async (_ms: number) => {});
     const fetchFn = vi
@@ -734,7 +794,7 @@ describe('generateDraft (two-call composer)', () => {
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
-  it('spaces the caption and X-post calls (default 250ms) to spread burst traffic', async () => {
+  it('spaces the caption and X-post calls (>=1000ms default) to spread burst traffic', async () => {
     const sleep = vi.fn(async (_ms: number) => {});
     const fetchFn = vi
       .fn()
@@ -742,7 +802,7 @@ describe('generateDraft (two-call composer)', () => {
       .mockResolvedValueOnce(okResponse('¡Bombazo! #Videojuegos'));
     await generateDraft(ARTICLE, deps({ fetchFn, sleep }));
     expect(sleep).toHaveBeenCalledWith(LLM_CALL_SPACING_MS);
-    expect(LLM_CALL_SPACING_MS).toBe(250);
+    expect(LLM_CALL_SPACING_MS).toBeGreaterThanOrEqual(1000);
   });
 
   it('disables the spacing delay when callSpacingMs is 0', async () => {

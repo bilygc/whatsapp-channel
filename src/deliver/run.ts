@@ -23,6 +23,8 @@ export interface DeliverWriteFn {
       limit?: number;
       /** Fresh-selection IDs: the writer drains these first, backfilling stale leftovers only with spare capacity. */
       articleIds?: number[];
+      /** Forwarded pacer seam (tests inject a noop; production leaves it unset for real free-tier pacing). */
+      sleep?: (ms: number) => Promise<void>;
     },
   ): Promise<WriteSummary>;
 }
@@ -133,6 +135,7 @@ export async function runDeliver(db: Database.Database, deps: DeliverDeps): Prom
         generate,
         limit: select.selected.length,
         articleIds: select.selected.map((a) => a.id),
+        sleep: deps.sleep,
       });
     } catch (err) {
       // The write run itself cannot start (e.g. articles table unreadable):

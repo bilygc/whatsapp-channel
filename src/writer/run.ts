@@ -2,6 +2,39 @@ import type Database from 'better-sqlite3';
 import type { LlmArticle } from './openrouter.js';
 import { normalizeCaption, normalizeTweet } from './validate.js';
 
+/**
+ * Inter-article pacing for the free-tier 20 req/min budget: each article costs
+ * TWO LLM calls (caption + X post). A ~6s gap with ±20% jitter spreads those
+ * pairs across the window so a run of 3–4 articles never bursts the limit.
+ * Overridable via the LLM_INTER_ARTICLE_DELAY_MS env var (0 disables).
+ */
+export const LLM_INTER_ARTICLE_DELAY_MS = 6000;
+
+/** ±20% jitter so repeated runs (and concurrent deliver windows) de-sync. */
+export const LLM_INTER_ARTICLE_JITTER = 0.2;
+
+/**
+ * Resolve the inter-article pacing delay from the environment. Empty/blank,
+ * non-numeric, non-integer, or negative values fall back to the default;
+ * `0` is a valid explicit value (disables pacing), distinct from "unset".
+ * Env is read at call time (not module load) so dotenv `config()` has run.
+ */
+export function resolveInterArticleDelayMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.LLM_INTER_ARTICLE_DELAY_MS?.trim();
+  const parsed = raw ? Number(raw) : NaN;
+  return raw && Number.isInteger(parsed) && parsed >= 0 ? parsed : LLM_INTER_ARTICLE_DELAY_MS;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Jittered delay in [base*(1-J), base*(1+J)], clamped to integer ms. */
+function interArticleDelay(baseMs: number, rnd: () => number): number {
+  const r = Math.min(1, Math.max(0, rnd()));
+  return Math.round(baseMs * (1 - LLM_INTER_ARTICLE_JITTER + 2 * LLM_INTER_ARTICLE_JITTER * r));
+}
+
 /** Both generated texts for one article. `xPost` is null when no X post was generated (yet). */
 export interface GeneratedDraft {
   caption: string;
@@ -36,6 +69,20 @@ export interface WriterDeps {
    * everything oldest-first.
    */
   articleIds?: number[];
+  /**
+   * Injectable pacer clock for the inter-article delay (default: real
+   * setTimeout). Tests inject a noop/spy; production leaves it unset so the
+   * real free-tier pacing applies.
+   */
+  sleep?: (ms: number) => Promise<void>;
+  /**
+   * Inter-article pacing delay in ms. Defaults to
+   * `resolveInterArticleDelayMs()` (env LLM_INTER_ARTICLE_DELAY_MS, 6000).
+   * `0` disables pacing entirely.
+   */
+  interArticleDelayMs?: number;
+  /** Injectable jitter source in [0,1) (default: Math.random). Tests inject for deterministic bounds. */
+  random?: () => number;
 }
 
 export interface ArticleResult {
@@ -134,7 +181,9 @@ function fetchOldestSelected(db: Database.Database, exclude: number[], take?: nu
  * draft (status `pending`) → mark article `used`. Failures are isolated per
  * article (LLM error, bad output, or SQLite hiccup): the error is recorded,
  * the article stays `selected` for a retry, and the rest of the run continues.
- * A failed run never loses a draft or an article. Throws a typed
+ * A jittered inter-article delay (`LLM_INTER_ARTICLE_DELAY_MS`) paces the
+ * two LLM calls per article under the free-tier 20 req/min limit, including
+ * after failures. A failed run never loses a draft or an article. Throws a typed
  * `writer run failed: <cause>` error only when the run itself cannot start
  * (e.g. articles table unreadable).
  */
@@ -146,8 +195,25 @@ export async function runWriter(db: Database.Database, deps: WriterDeps): Promis
     throw new Error(`writer run failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  const sleep = deps.sleep ?? defaultSleep;
+  const random = deps.random ?? Math.random;
+  const delayMs = deps.interArticleDelayMs ?? resolveInterArticleDelayMs();
+
   const results: ArticleResult[] = [];
-  for (const article of articles) {
+  for (let i = 0; i < articles.length; i++) {
+    // Pacing: the two LLM calls per article must not arrive back-to-back
+    // across articles (free tier is 20 req/min). Skip the first (nothing to
+    // space it from); keep pacing even after a failed article so a burst of
+    // retries still trickles out. A broken pacer is best-effort — it must
+    // never cost an article or lose a draft.
+    if (i > 0 && delayMs > 0) {
+      try {
+        await sleep(interArticleDelay(delayMs, random));
+      } catch {
+        // Best-effort pacing: continue rather than drop the remaining articles.
+      }
+    }
+    const article = articles[i];
     try {
       const raw = await deps.generate(article);
       const rawCaption = typeof raw === 'string' ? raw : raw.caption;

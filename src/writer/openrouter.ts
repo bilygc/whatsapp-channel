@@ -71,11 +71,13 @@ export const LLM_RATE_LIMIT_DELAYS_MS = [2000, 10_000, 30_000];
 
 /**
  * Spacing delay between the caption and X-post calls in `generateDraft`:
- * keeps the per-article burst from arriving back-to-back in the same
- * instant. Small on purpose (a failed run is re-run manually) and
- * overridable per call via `LlmDeps.callSpacingMs` (0 disables).
+ * keeps the per-article burst from arriving back-to-back in the same instant.
+ * 1000ms (≥1s) helps the free-tier 20 req/min budget spread each article's
+ * two calls; combined with the inter-article delay in `run.ts` it keeps a
+ * 3–4 article run under the limit. Overridable per call via
+ * `LlmDeps.callSpacingMs` (0 disables).
  */
-export const LLM_CALL_SPACING_MS = 250;
+export const LLM_CALL_SPACING_MS = 1000;
 
 /** 1 initial attempt + 1 retry per backoff delay (3 attempts total). */
 export const LLM_MAX_ATTEMPTS = LLM_RETRY_DELAYS_MS.length + 1;
@@ -245,6 +247,64 @@ function retryAfterMs(res: Response): number | null {
   }
 }
 
+/** OpenRouter's 429 rate-limit headers: burst (20/min) vs daily quota (1000/day). */
+const RATE_LIMIT_HEADERS: Array<[string, string]> = [
+  ['x-ratelimit-limit', 'limit'],
+  ['x-ratelimit-remaining', 'remaining'],
+  ['x-ratelimit-reset', 'reset'],
+];
+
+/**
+ * Provider-controlled values are hostile: strip control bytes (terminal
+ * escapes, forged newlines) and cap length before they reach an error string.
+ */
+function scrubRateLimitValue(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64);
+}
+
+/**
+ * Best-effort detail appended to an exhausted-429 error. The X-RateLimit-*
+ * headers distinguish a burst limit (20/min) from a daily quota (1000/day),
+ * and `error.metadata.provider_code` distinguishes an upstream provider
+ * limit. Everything here is provider-controlled — missing headers, an
+ * absent/malformed/oversize body — so this never throws and never lets a raw
+ * parse/cancel error mask the typed rate-limit failure. The body is read
+ * capped (same guard as a successful reply) and always released.
+ */
+async function rateLimitDetail(res: Response, maxBytes: number): Promise<string> {
+  const parts: string[] = [];
+  for (const [header, label] of RATE_LIMIT_HEADERS) {
+    try {
+      const raw = res.headers?.get(header);
+      if (raw != null) {
+        const value = scrubRateLimitValue(raw);
+        if (value !== '') parts.push(`${label}=${value}`);
+      }
+    } catch {
+      // A missing/hostile Headers object must not mask the rate-limit error.
+    }
+  }
+  try {
+    const body = await readJsonCapped(res, maxBytes);
+    const code = (body as { error?: { metadata?: { provider_code?: unknown } } })?.error?.metadata
+      ?.provider_code;
+    if (typeof code === 'string' || typeof code === 'number') {
+      const value = scrubRateLimitValue(String(code));
+      if (value !== '') parts.push(`provider_code=${value}`);
+    }
+  } catch {
+    // Unreadable/oversize/malformed 429 body: header detail still ships.
+  } finally {
+    // Release the connection even when the body was not readable at all.
+    try {
+      await res.body?.cancel();
+    } catch {
+      // A broken body must not mask the HTTP error.
+    }
+  }
+  return parts.length > 0 ? ` [${parts.join(', ')}]` : '';
+}
+
 /**
  * Transient transport errors worth one more attempt: dropped connections and
  * the like. NOT retryable: `AbortSignal.timeout` exhaustion (`TimeoutError` /
@@ -340,24 +400,35 @@ export async function generateCaption(article: LlmArticle, deps: LlmDeps): Promi
     }
 
     if (!res.ok) {
-      // Release the connection before throwing OR retrying; the status is all
-      // we report.
-      try {
-        await res.body?.cancel();
-      } catch {
-        // A broken body must not mask the HTTP error — ignore cancel failures.
-      }
       if (res.status === 429) {
         // Rate limiting gets its own, longer budget (up to 3 retries): the
         // provider asked us to slow down, so the short blip backoff must not
         // apply. Mixed failures consume both budgets independently.
         if (rateLimitRetries < LLM_RATE_LIMIT_DELAYS_MS.length) {
+          // Not exhausted: just release the body — 429 detail is only read once
+          // we give up, so retry attempts never pay to parse an error body.
+          try {
+            await res.body?.cancel();
+          } catch {
+            // A broken body must not mask the HTTP error — ignore cancel failures.
+          }
           const wait = retryAfterMs(res) ?? LLM_RATE_LIMIT_DELAYS_MS[rateLimitRetries];
           rateLimitRetries += 1;
           await sleep(wait);
           continue;
         }
-        throw fail(`HTTP 429 (rate limited, gave up after ${rateLimitRetries} retries)`);
+        // Exhausted: enrich the typed error with X-RateLimit-* headers and the
+        // upstream provider code (best-effort; a bad body never becomes a raw
+        // error). With no such info the suffix is empty, preserving the exact
+        // legacy message.
+        const detail = await rateLimitDetail(res, maxBytes);
+        throw fail(`HTTP 429 (rate limited, gave up after ${rateLimitRetries} retries)${detail}`);
+      }
+      // Other non-2xx (5xx included): release the connection before retry/throw.
+      try {
+        await res.body?.cancel();
+      } catch {
+        // A broken body must not mask the HTTP error — ignore cancel failures.
       }
       if (isRetryableStatus(res.status) && transientRetries < LLM_RETRY_DELAYS_MS.length) {
         await sleep(LLM_RETRY_DELAYS_MS[transientRetries]);
@@ -462,24 +533,35 @@ export async function generateXPost(article: LlmArticle, deps: LlmDeps): Promise
     }
 
     if (!res.ok) {
-      // Release the connection before throwing OR retrying; the status is all
-      // we report.
-      try {
-        await res.body?.cancel();
-      } catch {
-        // A broken body must not mask the HTTP error — ignore cancel failures.
-      }
       if (res.status === 429) {
         // Rate limiting gets its own, longer budget (up to 3 retries): the
         // provider asked us to slow down, so the short blip backoff must not
         // apply. Mixed failures consume both budgets independently.
         if (rateLimitRetries < LLM_RATE_LIMIT_DELAYS_MS.length) {
+          // Not exhausted: just release the body — 429 detail is only read once
+          // we give up, so retry attempts never pay to parse an error body.
+          try {
+            await res.body?.cancel();
+          } catch {
+            // A broken body must not mask the HTTP error — ignore cancel failures.
+          }
           const wait = retryAfterMs(res) ?? LLM_RATE_LIMIT_DELAYS_MS[rateLimitRetries];
           rateLimitRetries += 1;
           await sleep(wait);
           continue;
         }
-        throw fail(`HTTP 429 (rate limited, gave up after ${rateLimitRetries} retries)`);
+        // Exhausted: enrich the typed error with X-RateLimit-* headers and the
+        // upstream provider code (best-effort; a bad body never becomes a raw
+        // error). With no such info the suffix is empty, preserving the exact
+        // legacy message.
+        const detail = await rateLimitDetail(res, maxBytes);
+        throw fail(`HTTP 429 (rate limited, gave up after ${rateLimitRetries} retries)${detail}`);
+      }
+      // Other non-2xx (5xx included): release the connection before retry/throw.
+      try {
+        await res.body?.cancel();
+      } catch {
+        // A broken body must not mask the HTTP error — ignore cancel failures.
       }
       if (isRetryableStatus(res.status) && transientRetries < LLM_RETRY_DELAYS_MS.length) {
         await sleep(LLM_RETRY_DELAYS_MS[transientRetries]);
@@ -526,7 +608,7 @@ export interface GeneratedDraftRaw {
  * 429 exhausts the long backoff and throws BEFORE the X call is attempted,
  * so a rate-limited model never spends a second round of quota on the same
  * article. The two calls stay sequential (no parallelism): bursty parallel
- * calls are exactly what trips free-tier limits, and a short spacing delay
+ * calls are exactly what trips free-tier limits, and a ≥1s spacing delay
  * (`LLM_CALL_SPACING_MS`, via `deps.callSpacingMs`) spreads the burst.
  */
 export async function generateDraft(article: LlmArticle, deps: LlmDeps): Promise<GeneratedDraftRaw> {
